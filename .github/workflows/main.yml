@@ -1,16 +1,13 @@
 name: Build Il2CppTool for ARMv7 (Android 8.1)
 
 on:
-  workflow_dispatch:    # قابلیت اجرای دستی از دکمه Actions
+  workflow_dispatch:
   push:
-    branches: [ "main", "master" ]
-  pull_request:
     branches: [ "main", "master" ]
 
 jobs:
   build-armv7:
     runs-on: ubuntu-latest
-    
     steps:
       - name: Checkout source code
         uses: actions/checkout@v4
@@ -19,13 +16,18 @@ jobs:
         uses: android-actions/setup-android@v3
         with:
           ndk: true
-          ndk-version: r25c   # نسخه پایدار و سازگار با Android 8.1
+          ndk-version: r25c
+
+      - name: Fix dobby.h path (case sensitivity)
+        run: |
+          cd app/src/main/jni
+          if [ -d "Dobby" ] && [ ! -d "dobby" ]; then
+            ln -s Dobby dobby
+          fi
 
       - name: Build libIl2CppTool.so for armeabi-v7a
         run: |
           cd app/src/main
-          # APP_ABI=armeabi-v7a => معماری 32 بیتی مورد نظر
-          # APP_PLATFORM=android-27 => متناسب با اندروید 8.1
           $ANDROID_NDK_HOME/ndk-build APP_ABI=armeabi-v7a APP_PLATFORM=android-27 -j$(nproc)
 
       - name: Upload compiled SO file
