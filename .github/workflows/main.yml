@@ -9,7 +9,7 @@ jobs:
   build-armv7:
     runs-on: ubuntu-latest
     steps:
-      - name: دریافت سورس کد پروژه
+      - name: دریافت سورس کد
         uses: actions/checkout@v4
 
       - name: نصب Android NDK
@@ -18,41 +18,47 @@ jobs:
           ndk: true
           ndk-version: r25c
 
-      - name: نصب CMake
-        run: sudo apt-get update && sudo apt-get install -y cmake
-
-      # حل مشکل حساسیت حروف در لینوکس (پوشه Dobby با حرف بزرگ)
       - name: رفع مشکل dobby.h
         run: |
           cd app/src/main/jni
           ln -sf Dobby dobby
 
-      # دانلود سورس اصلی asmjit و ساخت کتابخانه 32 بیتی
-      - name: ساخت asmjit از سورس برای armeabi-v7a
+      - name: ساخت asmjit با NDK برای armeabi-v7a
         run: |
+          # دانلود سورس asmjit
           git clone --depth 1 https://github.com/asmjit/asmjit.git /tmp/asmjit
           cd /tmp/asmjit
-          mkdir build && cd build
-          cmake .. \
-            -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake \
-            -DANDROID_ABI=armeabi-v7a \
-            -DANDROID_PLATFORM=android-27 \
-            -DASMJIT_STATIC=ON \
-            -DASMJIT_BUILD_X86=OFF \
-            -DASMJIT_BUILD_ARM=ON \
-            -DCMAKE_BUILD_TYPE=Release
-          make -j$(nproc)
-          # کپی کتابخانه ساخته شده به جای فایل 64 بیتی داخل پروژه
-          cp src/asmjit/libasmjit.a $GITHUB_WORKSPACE/app/src/main/jni/asmjit/lib/
+          
+          # ساختن Android.mk ساده برای asmjit
+          cat > Android.mk << 'EOF'
+          LOCAL_PATH := $(call my-dir)
+          include $(CLEAR_VARS)
+          LOCAL_MODULE := asmjit
+          LOCAL_SRC_FILES := src/asmjit/asmjit.cpp
+          LOCAL_C_INCLUDES := $(LOCAL_PATH)/src
+          LOCAL_CPPFLAGS := -std=c++11 -fno-rtti -fno-exceptions -O2
+          include $(BUILD_STATIC_LIBRARY)
+          EOF
+          
+          # ساختن Application.mk
+          cat > Application.mk << 'EOF'
+          APP_ABI := armeabi-v7a
+          APP_PLATFORM := android-27
+          APP_STL := c++_static
+          EOF
+          
+          # اجرای ndk-build
+          $ANDROID_NDK_HOME/ndk-build -j$(nproc)
+          
+          # پیدا کردن و کپی کردن فایل ساخته شده
+          find . -name "libasmjit.a" -exec cp {} $GITHUB_WORKSPACE/app/src/main/jni/asmjit/lib/ \;
 
-      # ساخت فایل نهایی libIl2CppTool.so
-      - name: ساخت نهایی با NDK
+      - name: ساخت نهایی libIl2CppTool.so
         run: |
           cd app/src/main
           $ANDROID_NDK_HOME/ndk-build APP_ABI=armeabi-v7a APP_PLATFORM=android-27 APP_STL=c++_static -j$(nproc)
 
-      # آپلود خروجی
-      - name: ذخیره فایل ساخته شده
+      - name: ذخیره خروجی
         uses: actions/upload-artifact@v4
         with:
           name: libIl2CppTool_armeabi-v7a_Android8.1
