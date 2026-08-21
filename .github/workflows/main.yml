@@ -11,14 +11,15 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repository
+      - name: Checkout repository and submodules
         uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
       - name: Build with ndk-build
         run: |
           cd app/src/main
-          # Android 8.1 corresponds to API level 27 (android-27)
-          # Target armv7 via APP_ABI=armeabi-v7a
+          # Target armv7 (armeabi-v7a) and Android 8.1 (android-27)
           $ANDROID_NDK_ROOT/ndk-build -j$(nproc) APP_ABI=armeabi-v7a APP_PLATFORM=android-27
         shell: bash
 
