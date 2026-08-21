@@ -1,57 +1,35 @@
-name: Build Il2CppTool for ARMv7 (Android 8.1)
+name: Build Android APK
 
 on:
-  workflow_dispatch:
   push:
-    branches: [ "main", "master" ]
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
 
 jobs:
-  build-armv7:
+  build:
     runs-on: ubuntu-latest
+
     steps:
-      - name: دریافت سورس کد
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: نصب Android NDK
-        uses: android-actions/setup-android@v3
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
         with:
-          ndk: true
-          ndk-version: r25c
+          java-version: '17'
+          distribution: 'temurin'
+          cache: gradle
 
-      - name: نصب CMake
-        run: sudo apt-get update && sudo apt-get install -y cmake
+      - name: Grant execute permission for gradlew
+        run: chmod +x gradlew
 
-      - name: رفع مشکل dobby.h
-        run: |
-          cd app/src/main/jni
-          ln -sf Dobby dobby
+      - name: Build with Gradle (armv7)
+        # This command builds only the armeabi-v7a architecture
+        run: ./gradlew assembleDebug -Pandroid.injected.build.abi=armeabi-v7a
 
-      - name: ساخت asmjit با CMake برای armeabi-v7a
-        run: |
-          git clone --depth 1 https://github.com/asmjit/asmjit.git /tmp/asmjit
-          cd /tmp/asmjit
-          mkdir build && cd build
-          cmake .. \
-            -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake \
-            -DANDROID_ABI=armeabi-v7a \
-            -DANDROID_PLATFORM=android-27 \
-            -DASMJIT_STATIC=ON \
-            -DASMJIT_BUILD_X86=OFF \
-            -DASMJIT_BUILD_ARM=ON \
-            -DCMAKE_BUILD_TYPE=Release
-          make -j$(nproc)
-          # پیدا کردن فایل کتابخانه ساخته شده
-          LIB_FILE=$(find . -name "libasmjit.a" | head -n 1)
-          echo "کتابخانه پیدا شد: $LIB_FILE"
-          cp $LIB_FILE $GITHUB_WORKSPACE/app/src/main/jni/asmjit/lib/
-
-      - name: ساخت نهایی libIl2CppTool.so
-        run: |
-          cd app/src/main
-          $ANDROID_NDK_HOME/ndk-build APP_ABI=armeabi-v7a APP_PLATFORM=android-27 APP_STL=c++_static -j$(nproc)
-
-      - name: ذخیره خروجی
+      - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: libIl2CppTool_armeabi-v7a_Android8.1
-          path: app/src/main/libs/armeabi-v7a/libIl2CppTool.so
+          name: app-armeabi-v7a-debug
+          path: app/build/outputs/apk/debug/*.apk
