@@ -18,40 +18,32 @@ jobs:
           ndk: true
           ndk-version: r25c
 
+      - name: نصب CMake
+        run: sudo apt-get update && sudo apt-get install -y cmake
+
       - name: رفع مشکل dobby.h
         run: |
           cd app/src/main/jni
           ln -sf Dobby dobby
 
-      - name: ساخت asmjit با NDK برای armeabi-v7a
+      - name: ساخت asmjit با CMake برای armeabi-v7a
         run: |
-          # دانلود سورس asmjit
           git clone --depth 1 https://github.com/asmjit/asmjit.git /tmp/asmjit
           cd /tmp/asmjit
-          
-          # ساختن Android.mk ساده برای asmjit
-          cat > Android.mk << 'EOF'
-          LOCAL_PATH := $(call my-dir)
-          include $(CLEAR_VARS)
-          LOCAL_MODULE := asmjit
-          LOCAL_SRC_FILES := src/asmjit/asmjit.cpp
-          LOCAL_C_INCLUDES := $(LOCAL_PATH)/src
-          LOCAL_CPPFLAGS := -std=c++11 -fno-rtti -fno-exceptions -O2
-          include $(BUILD_STATIC_LIBRARY)
-          EOF
-          
-          # ساختن Application.mk
-          cat > Application.mk << 'EOF'
-          APP_ABI := armeabi-v7a
-          APP_PLATFORM := android-27
-          APP_STL := c++_static
-          EOF
-          
-          # اجرای ndk-build
-          $ANDROID_NDK_HOME/ndk-build -j$(nproc)
-          
-          # پیدا کردن و کپی کردن فایل ساخته شده
-          find . -name "libasmjit.a" -exec cp {} $GITHUB_WORKSPACE/app/src/main/jni/asmjit/lib/ \;
+          mkdir build && cd build
+          cmake .. \
+            -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake \
+            -DANDROID_ABI=armeabi-v7a \
+            -DANDROID_PLATFORM=android-27 \
+            -DASMJIT_STATIC=ON \
+            -DASMJIT_BUILD_X86=OFF \
+            -DASMJIT_BUILD_ARM=ON \
+            -DCMAKE_BUILD_TYPE=Release
+          make -j$(nproc)
+          # پیدا کردن فایل کتابخانه ساخته شده
+          LIB_FILE=$(find . -name "libasmjit.a" | head -n 1)
+          echo "کتابخانه پیدا شد: $LIB_FILE"
+          cp $LIB_FILE $GITHUB_WORKSPACE/app/src/main/jni/asmjit/lib/
 
       - name: ساخت نهایی libIl2CppTool.so
         run: |
