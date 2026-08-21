@@ -18,12 +18,22 @@ jobs:
           ndk: true
           ndk-version: r25c
 
-      - name: Fix dobby.h path (case sensitivity)
+      - name: Install CMake
+        run: sudo apt-get update && sudo apt-get install -y cmake
+
+      - name: Build asmjit from source for armeabi-v7a
         run: |
-          cd app/src/main/jni
-          if [ -d "Dobby" ] && [ ! -d "dobby" ]; then
-            ln -s Dobby dobby
-          fi
+          cd app/src/main/jni/asmjit
+          mkdir -p build && cd build
+          cmake .. \
+            -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake \
+            -DANDROID_ABI=armeabi-v7a \
+            -DANDROID_PLATFORM=android-27 \
+            -DASMJIT_STATIC=ON \
+            -DASMJIT_BUILD_X86=OFF \
+            -DASMJIT_BUILD_ARM=ON
+          make -j$(nproc)
+          cp libasmjit.a ../lib/
 
       - name: Build libIl2CppTool.so for armeabi-v7a
         run: |
