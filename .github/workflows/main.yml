@@ -1,10 +1,10 @@
-name: Build Android APK
+name: Build Il2CppTool (armv7)
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [ "main", "master" ]
   pull_request:
-    branches: [ "main" ]
+    branches: [ "main", "master" ]
 
 jobs:
   build:
@@ -14,22 +14,16 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up JDK 17
-        uses: actions/setup-java@v4
-        with:
-          java-version: '17'
-          distribution: 'temurin'
-          cache: gradle
+      - name: Build with ndk-build
+        run: |
+          cd app/src/main
+          # Android 8.1 corresponds to API level 27 (android-27)
+          # Target armv7 via APP_ABI=armeabi-v7a
+          $ANDROID_NDK_ROOT/ndk-build -j$(nproc) APP_ABI=armeabi-v7a APP_PLATFORM=android-27
+        shell: bash
 
-      - name: Grant execute permission for gradlew
-        run: chmod +x gradlew
-
-      - name: Build with Gradle (armv7)
-        # This command builds only the armeabi-v7a architecture
-        run: ./gradlew assembleDebug -Pandroid.injected.build.abi=armeabi-v7a
-
-      - name: Upload APK
+      - name: Upload Compiled .so Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: app-armeabi-v7a-debug
-          path: app/build/outputs/apk/debug/*.apk
+          name: libIl2CppTool-armeabi-v7a
+          path: app/src/main/libs/armeabi-v7a/libIl2CppTool.so
