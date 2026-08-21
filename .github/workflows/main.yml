@@ -11,10 +11,19 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repository and submodules
+      - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          submodules: recursive
+
+      - name: Initialize Git Submodules
+        run: |
+          git submodule update --init --recursive
+
+      - name: Verify Submodule Headers
+        run: |
+          echo "Checking Dobby files..."
+          ls -la app/src/main/jni/Dobby || true
+          echo "Locating dobby.h..."
+          find app/src/main/jni -name "dobby.h"
 
       - name: Build with ndk-build
         run: |
