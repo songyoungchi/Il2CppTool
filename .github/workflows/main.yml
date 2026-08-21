@@ -1,30 +1,40 @@
 name: Build Il2CppTool for ARMv7 (Android 8.1)
 
 on:
-  workflow_dispatch:
+  workflow_dispatch:    # اجرای دستی با دکمه
   push:
     branches: [ "main", "master" ]
 
 jobs:
   build-armv7:
     runs-on: ubuntu-latest
+    
     steps:
-      - name: Checkout source code
+      - name: دریافت سورس کد (Checkout)
         uses: actions/checkout@v4
 
-      - name: Setup Android NDK
+      - name: نصب Android NDK
         uses: android-actions/setup-android@v3
         with:
           ndk: true
-          ndk-version: r25c
+          ndk-version: r25c   # نسخه پایدار
 
-      - name: Install CMake
+      - name: نصب CMake (برای کامپایل asmjit)
         run: sudo apt-get update && sudo apt-get install -y cmake
 
-      - name: Build asmjit from source for armeabi-v7a
+      - name: رفع مشکل حساسیت حروف (dobby.h)
+        run: |
+          cd app/src/main/jni
+          # اگر پوشه Dobby وجود داشت و dobby وجود نداشت، یک لینک بساز
+          if [ -d "Dobby" ] && [ ! -d "dobby" ]; then
+            ln -s Dobby dobby
+          fi
+
+      - name: کامپایل asmjit از سورس برای armeabi-v7a
         run: |
           cd app/src/main/jni/asmjit
           mkdir -p build && cd build
+          # کانفیگ با NDK برای معماری 32 بیتی و اندروید 8.1
           cmake .. \
             -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake \
             -DANDROID_ABI=armeabi-v7a \
@@ -32,15 +42,18 @@ jobs:
             -DASMJIT_STATIC=ON \
             -DASMJIT_BUILD_X86=OFF \
             -DASMJIT_BUILD_ARM=ON
+          # ساخت کتابخانه
           make -j$(nproc)
+          # جایگزینی فایل 64 بیتی قدیمی با فایل 32 بیتی جدید
           cp libasmjit.a ../lib/
 
-      - name: Build libIl2CppTool.so for armeabi-v7a
+      - name: ساخت فایل نهایی libIl2CppTool.so
         run: |
           cd app/src/main
+          # کامپایل با معماری 32 بیتی و SDK 27
           $ANDROID_NDK_HOME/ndk-build APP_ABI=armeabi-v7a APP_PLATFORM=android-27 -j$(nproc)
 
-      - name: Upload compiled SO file
+      - name: ذخیره خروجی (Upload Artifact)
         uses: actions/upload-artifact@v4
         with:
           name: libIl2CppTool_armeabi-v7a_API27
