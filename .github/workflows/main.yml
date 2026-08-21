@@ -1,39 +1,75 @@
-name: Build Il2CppTool (armv7)
+name: Build libIl2CppTool (armeabi-v7a / Android 8.1)
 
+# Manual trigger only - this is an on-demand build, not CI-on-every-push.
+# Run it from the Actions tab ("Run workflow"), or via `gh workflow run`.
 on:
-  push:
-    branches: [ "main", "master" ]
-  pull_request:
-    branches: [ "main", "master" ]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch, tag, or commit to build"
+        required: false
+        default: "main"
+      abi:
+        description: "Target ABI(s) for ndk-build (armv7 = armeabi-v7a). Comma-separated for multiple, e.g. armeabi-v7a,arm64-v8a"
+        required: false
+        default: "armeabi-v7a"
+      api_level:
+        description: "Android API level (27 = Android 8.1 Oreo)"
+        required: false
+        default: "27"
+      ndk_package:
+        description: "sdkmanager NDK package id - see https://developer.android.com/ndk/downloads for current values"
+        required: false
+        default: "28.0.13004108"
 
 jobs:
   build:
     runs-on: ubuntu-latest
-
+    timeout-minutes: 30
     steps:
-      - name: Checkout repository
+      - name: Checkout Il2CppTool
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+          submodules: recursive   # harmless no-op if the repo turns out to have none
 
-      - name: Initialize Git Submodules
+      - name: Install Android NDK (${{ inputs.ndk_package }})
         run: |
-          git submodule update --init --recursive
+          set -eu
+          SDK_ROOT="${ANDROID_SDK_ROOT:-$ANDROID_HOME}"
+          SDKMANAGER="$(command -v sdkmanager || echo "$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager")"
 
-      - name: Verify Submodule Headers
+          # Accept licenses. Usually already accepted on GitHub-hosted runners,
+          # this is just a safety net so a fresh runner image doesn't stall.
+          yes | "$SDKMANAGER" --licenses > /dev/null || true
+
+          "$SDKMANAGER" --install "ndk;${{ inputs.ndk_package }}"
+          echo "ANDROID_NDK_HOME=$SDK_ROOT/ndk/${{ inputs.ndk_package }}" >> "$GITHUB_ENV"
+
+      - name: ndk-build (APP_ABI=${{ inputs.abi }}, APP_PLATFORM=android-${{ inputs.api_level }})
         run: |
-          echo "Checking Dobby files..."
-          ls -la app/src/main/jni/Dobby || true
-          echo "Locating dobby.h..."
-          find app/src/main/jni -name "dobby.h"
+          set -eu
+          chmod +x build.sh
+          # build.sh just cd's into app/src/main and calls
+          # $ANDROID_NDK_HOME/ndk-build, forwarding any extra args as
+          # ndk-build / Application.mk variable overrides on the command
+          # line - that's how we swap the repo's default arm64-v8a /
+          # android-28 for armv7 / Android 8.1 without editing Application.mk.
+          # (Command-line make variables always win over the file's own
+          # APP_ABI / APP_PLATFORM assignments.)
+          ./build.sh APP_ABI=${{ inputs.abi }} APP_PLATFORM=android-${{ inputs.api_level }}
 
-      - name: Build with ndk-build
+      - name: Verify build output
         run: |
-          cd app/src/main
-          # Target armv7 (armeabi-v7a) and Android 8.1 (android-27)
-          $ANDROID_NDK_ROOT/ndk-build -j$(nproc) APP_ABI=armeabi-v7a APP_PLATFORM=android-27
-        shell: bash
+          set -eu
+          echo "Produced libraries:"
+          find app/src/main/libs -name "*.so" -exec ls -lh {} \;
+          find app/src/main/libs -name "*.so" | grep -q . || { echo "::error::No .so file was produced"; exit 1; }
 
-      - name: Upload Compiled .so Artifact
+      - name: Upload libIl2CppTool.so
         uses: actions/upload-artifact@v4
         with:
-          name: libIl2CppTool-armeabi-v7a
-          path: app/src/main/libs/armeabi-v7a/libIl2CppTool.so
+          name: libIl2CppTool-${{ inputs.abi }}-api${{ inputs.api_level }}
+          path: app/src/main/libs/
+          if-no-files-found: error
+          retention-days: 14
