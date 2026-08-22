@@ -1,78 +1,173 @@
-name: Build Android App
+name: Build libIl2CppTool (armeabi-v7a / Android 8.1)
 
 on:
-  push:
-    branches: [ "main", "master" ]
-  pull_request:
-    branches: [ "main", "master" ]
   workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch, tag, or commit to build"
+        required: false
+        default: "main"
+      abi:
+        description: "Target ABI for ndk-build (armv7 = armeabi-v7a). Single value only - the asmjit rebuild step doesn't loop over a comma-separated list."
+        required: false
+        default: "armeabi-v7a"
+      api_level:
+        description: "Android API level (27 = Android 8.1 Oreo)"
+        required: false
+        default: "27"
+      ndk_package:
+        description: "sdkmanager NDK package id - see https://developer.android.com/ndk/downloads for current values"
+        required: false
+        default: "28.0.13004108"
+      asmjit_ref:
+        description: "asmjit git commit/tag to build. Must be 594cb9e or a fork with AArch32 support."
+        required: false
+        default: "594cb9e"   # <-- updated default
+      asmjit_repo:
+        description: "asmjit repository URL (optional, only used if no buildable vendored source is found)"
+        required: false
+        default: "https://github.com/asmjit/asmjit.git"
 
 jobs:
   build:
     runs-on: ubuntu-latest
-
+    timeout-minutes: 30
     steps:
-      - name: Checkout Repository
+      - name: Checkout Il2CppTool
         uses: actions/checkout@v4
-
-      - name: Set up JDK 17
-        uses: actions/setup-java@v4
         with:
-          distribution: 'zulu'
-          java-version: '17'
-          cache: 'gradle'
+          ref: ${{ inputs.ref }}
+          submodules: recursive
 
-      - name: Setup Android NDK
-        uses: nsetup/setup-ndk@v1
-        with:
-          ndk-version: r25c
-
-      - name: Build AsmJit Static Libraries (Commit 594cb9e)
+      - name: Audit vendored prebuilt native libraries
         run: |
-          # 1. Clone AsmJit at exact commit matching ABI namespace _abi_1_13
-          git clone https://github.com/asmjit/asmjit.git /tmp/asmjit
-          cd /tmp/asmjit
-          git checkout 594cb9e
+          set -eu
+          echo "=== Prebuilt .a archives (architecture of their .o members) ==="
+          find app/src/main/jni -type f -name "*.a" | while read -r lib; do
+            echo "--- $lib ---"
+            TMPX="$(mktemp -d)"
+            ABS_LIB="$(cd "$(dirname "$lib")" && pwd)/$(basename "$lib")"
+            (cd "$TMPX" && ar x "$ABS_LIB" 2>/dev/null) || echo "  (ar x failed, skipping)"
+            FIRST_O="$(find "$TMPX" -name '*.o' 2>/dev/null | head -n1)"
+            if [ -n "$FIRST_O" ]; then file "$FIRST_O"; else echo "  (no extractable .o members)"; fi
+            rm -rf "$TMPX"
+          done
+          echo
+          echo "=== Prebuilt .so files ==="
+          find app/src/main/jni -type f -name "*.so" -exec file {} \;
+          echo
+          echo ">>> Target ABI is ${{ inputs.abi }} - expect ARM/32-bit above for that ABI's own libs; any AArch64 or x86 entries WILL fail to link and need the same rebuild-from-source treatment asmjit got below. <<<"
+          echo
 
-          # 2. Build for arm64-v8a
-          mkdir -p build-arm64
-          cmake -B build-arm64 \
-            -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake \
-            -DANDROID_ABI=arm64-v8a \
-            -DANDROID_PLATFORM=android-21 \
+          DOBBY_HEADER="$(find . -iname 'dobby.h' | head -n1)"
+          if [ -z "$DOBBY_HEADER" ]; then
+            echo "::error::No dobby.h found anywhere in the checked-out repo - the header itself is missing from this checkout, not just an Android.mk wiring gap."
+            exit 1
+          fi
+          DOBBY_INC_DIR="$(cd "$(dirname "$DOBBY_HEADER")" && pwd)"
+          echo "dobby.h include dir: $DOBBY_INC_DIR"
+          echo "DOBBY_INC_DIR=$DOBBY_INC_DIR" >> "$GITHUB_ENV"
+
+      - name: Install Android NDK (${{ inputs.ndk_package }})
+        run: |
+          set -eu
+          SDK_ROOT="${ANDROID_SDK_ROOT:-$ANDROID_HOME}"
+          SDKMANAGER="$(command -v sdkmanager || echo "$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager")"
+          yes | "$SDKMANAGER" --licenses > /dev/null || true
+          "$SDKMANAGER" --install "ndk;${{ inputs.ndk_package }}"
+          echo "ANDROID_NDK_HOME=$SDK_ROOT/ndk/${{ inputs.ndk_package }}" >> "$GITHUB_ENV"
+
+      - name: Rebuild asmjit for ${{ inputs.abi }} (vendored prebuilt is arm64-v8a only)
+        run: |
+          set -eu
+          PREBUILT_A="$(find . -iname 'libasmjit.a' | head -n1)"
+          if [ -z "$PREBUILT_A" ]; then
+            echo "::error::No libasmjit.a found to replace - Android.mk's asmjit wiring may differ from what this step assumes."
+            exit 1
+          fi
+          echo "Existing prebuilt to replace: $PREBUILT_A"
+          file "$PREBUILT_A" || true
+
+          ASMJIT_ROOT="$(dirname "$(dirname "$PREBUILT_A")")"
+          echo "asmjit tree layout:"
+          find "$ASMJIT_ROOT" -maxdepth 3
+
+          # Look for a buildable vendored source tree (with CMakeLists.txt)
+          SRC=""
+          LOCAL_CORE="$(find "$ASMJIT_ROOT" -iname 'assembler.cpp' -path '*core*' | head -n1)"
+          if [ -n "$LOCAL_CORE" ]; then
+            CANDIDATE="$(dirname "$LOCAL_CORE")"
+            while [ "$CANDIDATE" != "/" ] && [ "$CANDIDATE" != "." ]; do
+              if [ -f "$CANDIDATE/CMakeLists.txt" ]; then
+                SRC="$CANDIDATE"
+                break
+              fi
+              CANDIDATE="$(dirname "$CANDIDATE")"
+            done
+          fi
+
+          if [ -n "$SRC" ]; then
+            echo "Vendored buildable asmjit source found at $SRC - building from it."
+          else
+            echo "No buildable vendored source found - fetching asmjit from upstream instead."
+            SRC="$(mktemp -d)/asmjit"
+            git clone --quiet "${{ inputs.asmjit_repo }}" "$SRC"
+            if [ -n "${{ inputs.asmjit_ref }}" ]; then
+              git -C "$SRC" checkout --quiet "${{ inputs.asmjit_ref }}"
+            fi
+            echo "Using asmjit @ $(git -C "$SRC" rev-parse --short HEAD)"
+          fi
+
+          BUILD_DIR="$(mktemp -d)"
+          cmake -S "$SRC" -B "$BUILD_DIR" \
+            -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=${{ inputs.abi }} \
+            -DANDROID_PLATFORM=android-${{ inputs.api_level }} \
+            -DCMAKE_BUILD_TYPE=Release \
             -DASMJIT_STATIC=ON \
-            -DCMAKE_BUILD_TYPE=Release
-          cmake --build build-arm64 --config Release
+            -DASMJIT_TEST=OFF
+          cmake --build "$BUILD_DIR" -j"$(nproc)"
 
-          # 3. Build for armeabi-v7a
-          mkdir -p build-arm32
-          cmake -B build-arm32 \
-            -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake \
-            -DANDROID_ABI=armeabi-v7a \
-            -DANDROID_PLATFORM=android-21 \
-            -DASMJIT_STATIC=ON \
-            -DCMAKE_BUILD_TYPE=Release
-          cmake --build build-arm32 --config Release
+          NEW_A="$(find "$BUILD_DIR" -iname 'libasmjit.a' | head -n1)"
+          if [ -z "$NEW_A" ]; then
+            echo "::error::asmjit build finished but no libasmjit.a was produced - check the CMake/build log above."
+            exit 1
+          fi
+          file "$NEW_A" || true
 
-          # 4. Copy generated libraries into JNI directory
-          cd $GITHUB_WORKSPACE
-          mkdir -p app/src/main/jni/asmjit/lib/arm64-v8a
-          mkdir -p app/src/main/jni/asmjit/lib/armeabi-v7a
+          # Verify the rebuilt archive actually contains the AArch32 symbols required
+          # by this project. This is the definitive check for the link failure.
+          NM="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm"
+          if ! "$NM" -C "$NEW_A" | grep -q 'asmjit::_abi_1_13::a32::Assembler'; then
+            echo "::error::Rebuilt libasmjit.a does not contain a32::Assembler symbols."
+            echo "::error::The asmjit commit/configuration is missing AArch32 support."
+            echo "::error::Please use asmjit commit 594cb9e or a fork that includes the AArch32 backend."
+            exit 1
+          fi
 
-          cp /tmp/asmjit/build-arm64/libasmjit.a app/src/main/jni/asmjit/lib/arm64-v8a/
-          cp /tmp/asmjit/build-arm32/libasmjit.a app/src/main/jni/asmjit/lib/armeabi-v7a/
-          
-          # Fallback copy to base lib folder for single-ABI setups
-          cp /tmp/asmjit/build-arm64/libasmjit.a app/src/main/jni/asmjit/lib/libasmjit.a
+          cp "$NEW_A" "$PREBUILT_A"
+          echo "Replaced $PREBUILT_A with a freshly built ${{ inputs.abi }} version containing AArch32."
 
-      - name: Make Gradle Wrapper Executable
-        run: chmod +x gradlew
+      - name: ndk-build (APP_ABI=${{ inputs.abi }}, APP_PLATFORM=android-${{ inputs.api_level }})
+        run: |
+          set -eu
+          chmod +x build.sh
+          ./build.sh APP_ABI=${{ inputs.abi }} APP_PLATFORM=android-${{ inputs.api_level }} APP_CFLAGS="-I${DOBBY_INC_DIR}"
 
-      - name: Build APK with Gradle
-        run: ./gradlew assembleDebug --stacktrace
+      - name: Verify build output
+        run: |
+          set -eu
+          echo "Produced libraries:"
+          find app/src/main/libs -name "*.so" -exec ls -lh {} \;
+          find app/src/main/libs -name "*.so" | grep -q . || { echo "::error::No .so file was produced"; exit 1; }
+          echo
+          echo "Architecture check:"
+          find app/src/main/libs -name "*.so" -exec file {} \;
 
-      - name: Upload Build Artifacts
+      - name: Upload libIl2CppTool.so
         uses: actions/upload-artifact@v4
         with:
-          name: app-debug
-          path: app/build/outputs/apk/debug/*.apk
+          name: libIl2CppTool-${{ inputs.abi }}-api${{ inputs.api_level }}
+          path: app/src/main/libs/
+          if-no-files-found: error
+          retention-days: 14
