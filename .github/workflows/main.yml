@@ -10,7 +10,7 @@ on:
         required: false
         default: "main"
       abi:
-        description: "Target ABI(s) for ndk-build (armv7 = armeabi-v7a). Comma-separated for multiple, e.g. armeabi-v7a,arm64-v8a"
+        description: "Target ABI for ndk-build (armv7 = armeabi-v7a). Single value only - the asmjit rebuild step doesn't loop over a comma-separated list."
         required: false
         default: "armeabi-v7a"
       api_level:
@@ -21,6 +21,10 @@ on:
         description: "sdkmanager NDK package id - see https://developer.android.com/ndk/downloads for current values"
         required: false
         default: "28.0.13004108"
+      asmjit_ref:
+        description: "Optional asmjit git ref (tag/commit) to build if the repo doesn't vendor buildable asmjit source. Blank = upstream default branch HEAD."
+        required: false
+        default: ""
 
 jobs:
   build:
@@ -33,32 +37,39 @@ jobs:
           ref: ${{ inputs.ref }}
           submodules: recursive   # harmless no-op if the repo turns out to have none
 
-      - name: Locate Dobby headers & prebuilt libraries
-        # armeabi-v7a fails with "'dobby.h' file not found" compiling
-        # jni/Menu/ImGui.cpp (which hooks eglSwapBuffers via Dobby), even
-        # though the arm64-v8a build finds it fine. The header itself is
-        # vendored in the repo either way - Android.mk just isn't wiring
-        # its include path up for anything but arm64-v8a. This step finds
-        # the real path at checkout time (rather than guessing it) and
-        # also surfaces whether an armeabi-v7a Dobby archive/.so actually
-        # exists, since that's the next thing that can fail (at link time)
-        # and no CI step can conjure a missing prebuilt into existence.
+      - name: Audit vendored prebuilt native libraries
+        # We've hit two different "vendored prebuilt only covers
+        # arm64-v8a" surprises in a row now (Dobby's header wiring, then
+        # asmjit's actual .a). Rather than find a third one the hard way,
+        # inspect every prebuilt .a/.so under jni/ up front and print what
+        # architecture each is actually built for. Also locates dobby.h
+        # for the include-path fix used in the ndk-build step later.
         run: |
           set -eu
-          echo "All dobby.h matches in the repo:"
-          find . -iname "dobby.h" -exec ls -la {} \; || true
+          echo "=== Prebuilt .a archives (architecture of their .o members) ==="
+          find app/src/main/jni -type f -name "*.a" | while read -r lib; do
+            echo "--- $lib ---"
+            TMPX="$(mktemp -d)"
+            ABS_LIB="$(cd "$(dirname "$lib")" && pwd)/$(basename "$lib")"
+            (cd "$TMPX" && ar x "$ABS_LIB" 2>/dev/null) || echo "  (ar x failed, skipping)"
+            FIRST_O="$(find "$TMPX" -name '*.o' 2>/dev/null | head -n1)"
+            if [ -n "$FIRST_O" ]; then file "$FIRST_O"; else echo "  (no extractable .o members)"; fi
+            rm -rf "$TMPX"
+          done
           echo
-          echo "All dobby-related .a/.so files in the repo (by ABI folder if any):"
-          find . -iname "*dobby*" \( -name "*.a" -o -name "*.so" \) -exec ls -la {} \; || true
+          echo "=== Prebuilt .so files ==="
+          find app/src/main/jni -type f -name "*.so" -exec file {} \;
+          echo
+          echo ">>> Target ABI is ${{ inputs.abi }} - expect ARM/32-bit above for that ABI's own libs; any AArch64 or x86 entries WILL fail to link and need the same rebuild-from-source treatment asmjit got below. <<<"
           echo
 
           DOBBY_HEADER="$(find . -iname 'dobby.h' | head -n1)"
           if [ -z "$DOBBY_HEADER" ]; then
-            echo "::error::No dobby.h found anywhere in the checked-out repo - it isn't just an Android.mk wiring issue, the header itself is missing from this checkout."
+            echo "::error::No dobby.h found anywhere in the checked-out repo - the header itself is missing from this checkout, not just an Android.mk wiring gap."
             exit 1
           fi
           DOBBY_INC_DIR="$(cd "$(dirname "$DOBBY_HEADER")" && pwd)"
-          echo "Will add to include path: $DOBBY_INC_DIR"
+          echo "dobby.h include dir: $DOBBY_INC_DIR"
           echo "DOBBY_INC_DIR=$DOBBY_INC_DIR" >> "$GITHUB_ENV"
 
       - name: Install Android NDK (${{ inputs.ndk_package }})
@@ -74,20 +85,103 @@ jobs:
           "$SDKMANAGER" --install "ndk;${{ inputs.ndk_package }}"
           echo "ANDROID_NDK_HOME=$SDK_ROOT/ndk/${{ inputs.ndk_package }}" >> "$GITHUB_ENV"
 
+      - name: Rebuild asmjit for ${{ inputs.abi }} (vendored prebuilt is arm64-v8a only)
+        # Confirmed from a real build log: jni/asmjit/lib/libasmjit.a is a
+        # prebuilt for arm64-v8a only, at a single fixed (non-ABI-scoped)
+        # path - ld.lld's "incompatible with armelf_linux_eabi" means the
+        # object code inside is AArch64, not AArch32. No CI trick makes a
+        # missing armv7 build appear; we have to actually produce one.
+        #
+        # If the repo vendors asmjit's own buildable .cpp source next to
+        # the prebuilt, we build from that (exact match with the headers
+        # the project already compiles against). Otherwise we pull source
+        # from asmjit's own upstream repo and build it against the
+        # vendored headers. Either way we overwrite the prebuilt .a in
+        # place, so Android.mk's existing LOCAL_SRC_FILES path picks up
+        # the new one transparently.
+        #
+        # Residual risk: if we fall back to upstream and it's a
+        # meaningfully different version than the vendored headers, you
+        # could hit a header/impl mismatch. asmjit's core
+        # Assembler/CodeHolder/JitRuntime API has been stable a long time
+        # so this is unlikely, but if the build below fails looking like
+        # an API mismatch (missing members, changed signatures) rather
+        # than a plain compile error, pin asmjit_ref to an older tag and
+        # re-run.
+        run: |
+          set -eu
+          PREBUILT_A="$(find . -iname 'libasmjit.a' | head -n1)"
+          if [ -z "$PREBUILT_A" ]; then
+            echo "::error::No libasmjit.a found to replace - Android.mk's asmjit wiring may differ from what this step assumes."
+            exit 1
+          fi
+          echo "Existing prebuilt to replace: $PREBUILT_A"
+          file "$PREBUILT_A" || true
+
+          ASMJIT_ROOT="$(dirname "$(dirname "$PREBUILT_A")")"
+          echo "asmjit tree layout:"
+          find "$ASMJIT_ROOT" -maxdepth 3
+
+          # Walk upward from any vendored core/assembler.cpp looking for a
+          # CMakeLists.txt, however deeply it's nested - more robust than
+          # assuming a fixed directory depth.
+          SRC=""
+          LOCAL_CORE="$(find "$ASMJIT_ROOT" -iname 'assembler.cpp' -path '*core*' | head -n1)"
+          if [ -n "$LOCAL_CORE" ]; then
+            CANDIDATE="$(dirname "$LOCAL_CORE")"
+            while [ "$CANDIDATE" != "/" ] && [ "$CANDIDATE" != "." ]; do
+              if [ -f "$CANDIDATE/CMakeLists.txt" ]; then
+                SRC="$CANDIDATE"
+                break
+              fi
+              CANDIDATE="$(dirname "$CANDIDATE")"
+            done
+          fi
+
+          if [ -n "$SRC" ]; then
+            echo "Vendored buildable asmjit source found at $SRC - building from it."
+          else
+            echo "No buildable vendored source found - fetching asmjit from upstream instead."
+            SRC="$(mktemp -d)/asmjit"
+            git clone --quiet https://github.com/asmjit/asmjit.git "$SRC"
+            if [ -n "${{ inputs.asmjit_ref }}" ]; then
+              git -C "$SRC" checkout --quiet "${{ inputs.asmjit_ref }}"
+            fi
+            echo "Using asmjit @ $(git -C "$SRC" rev-parse --short HEAD)"
+          fi
+
+          BUILD_DIR="$(mktemp -d)"
+          cmake -S "$SRC" -B "$BUILD_DIR" \
+            -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=${{ inputs.abi }} \
+            -DANDROID_PLATFORM=android-${{ inputs.api_level }} \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DASMJIT_STATIC=ON \
+            -DASMJIT_TEST=OFF
+          cmake --build "$BUILD_DIR" -j"$(nproc)"
+
+          NEW_A="$(find "$BUILD_DIR" -iname 'libasmjit.a' | head -n1)"
+          if [ -z "$NEW_A" ]; then
+            echo "::error::asmjit build finished but no libasmjit.a was produced - check the CMake/build log above."
+            exit 1
+          fi
+          file "$NEW_A" || true
+          cp "$NEW_A" "$PREBUILT_A"
+          echo "Replaced $PREBUILT_A with a freshly built ${{ inputs.abi }} version."
+
       - name: ndk-build (APP_ABI=${{ inputs.abi }}, APP_PLATFORM=android-${{ inputs.api_level }})
         run: |
           set -eu
           chmod +x build.sh
-          # build.sh just cd's into app/src/main and calls
-          # $ANDROID_NDK_HOME/ndk-build, forwarding any extra args as
+          # build.sh cd's into app/src/main and calls
+          # $ANDROID_NDK_HOME/ndk-build, forwarding extra args as
           # ndk-build / Application.mk variable overrides on the command
           # line - that's how we swap the repo's default arm64-v8a /
-          # android-28 for armv7 / Android 8.1 without editing Application.mk.
-          # (Command-line make variables always win over the file's own
-          # APP_ABI / APP_PLATFORM assignments.) We also force-add Dobby's
-          # include dir via APP_CFLAGS, which applies to every module in
-          # the project, to work around Android.mk not exporting it for
-          # this ABI (see the "Locate Dobby" step above).
+          # android-28 for armv7 / Android 8.1 without editing
+          # Application.mk (command-line make vars win over the file's
+          # own assignments). We also force-add Dobby's include dir via
+          # APP_CFLAGS, working around Android.mk not exporting it for
+          # this ABI.
           ./build.sh APP_ABI=${{ inputs.abi }} APP_PLATFORM=android-${{ inputs.api_level }} APP_CFLAGS="-I${DOBBY_INC_DIR}"
 
       - name: Verify build output
@@ -96,6 +190,9 @@ jobs:
           echo "Produced libraries:"
           find app/src/main/libs -name "*.so" -exec ls -lh {} \;
           find app/src/main/libs -name "*.so" | grep -q . || { echo "::error::No .so file was produced"; exit 1; }
+          echo
+          echo "Architecture check:"
+          find app/src/main/libs -name "*.so" -exec file {} \;
 
       - name: Upload libIl2CppTool.so
         uses: actions/upload-artifact@v4
