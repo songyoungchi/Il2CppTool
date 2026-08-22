@@ -1,4 +1,4 @@
-name: Build Android Project (Source-Built AsmJit)
+name: Build Android App
 
 on:
   push:
@@ -18,32 +18,61 @@ jobs:
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
-          distribution: 'temurin'
+          distribution: 'zulu'
           java-version: '17'
+          cache: 'gradle'
 
       - name: Setup Android NDK
         uses: nsetup/setup-ndk@v1
         with:
           ndk-version: r25c
 
-      - name: Fetch Matching AsmJit Source (Commit 594cb9e)
+      - name: Build AsmJit Static Libraries (Commit 594cb9e)
         run: |
-          # Remove broken header/source directory if present
-          rm -rf app/src/main/jni/asmjit
-          
-          # Clone upstream and pin to commit 594cb9e
-          git clone https://github.com/asmjit/asmjit.git app/src/main/jni/asmjit
-          cd app/src/main/jni/asmjit
+          # 1. Clone AsmJit at exact commit matching ABI namespace _abi_1_13
+          git clone https://github.com/asmjit/asmjit.git /tmp/asmjit
+          cd /tmp/asmjit
           git checkout 594cb9e
 
-      - name: Grant Execute Permission for Gradlew
+          # 2. Build for arm64-v8a
+          mkdir -p build-arm64
+          cmake -B build-arm64 \
+            -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=android-21 \
+            -DASMJIT_STATIC=ON \
+            -DCMAKE_BUILD_TYPE=Release
+          cmake --build build-arm64 --config Release
+
+          # 3. Build for armeabi-v7a
+          mkdir -p build-arm32
+          cmake -B build-arm32 \
+            -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake \
+            -DANDROID_ABI=armeabi-v7a \
+            -DANDROID_PLATFORM=android-21 \
+            -DASMJIT_STATIC=ON \
+            -DCMAKE_BUILD_TYPE=Release
+          cmake --build build-arm32 --config Release
+
+          # 4. Copy generated libraries into JNI directory
+          cd $GITHUB_WORKSPACE
+          mkdir -p app/src/main/jni/asmjit/lib/arm64-v8a
+          mkdir -p app/src/main/jni/asmjit/lib/armeabi-v7a
+
+          cp /tmp/asmjit/build-arm64/libasmjit.a app/src/main/jni/asmjit/lib/arm64-v8a/
+          cp /tmp/asmjit/build-arm32/libasmjit.a app/src/main/jni/asmjit/lib/armeabi-v7a/
+          
+          # Fallback copy to base lib folder for single-ABI setups
+          cp /tmp/asmjit/build-arm64/libasmjit.a app/src/main/jni/asmjit/lib/libasmjit.a
+
+      - name: Make Gradle Wrapper Executable
         run: chmod +x gradlew
 
       - name: Build APK with Gradle
-        run: ./gradlew assembleRelease --stacktrace
+        run: ./gradlew assembleDebug --stacktrace
 
-      - name: Upload APK Artifact
+      - name: Upload Build Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: app-release-source-built
-          path: app/build/outputs/apk/release/*.apk
+          name: app-debug
+          path: app/build/outputs/apk/debug/*.apk
