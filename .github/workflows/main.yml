@@ -1,4 +1,4 @@
-name: Build Android Project (Prebuilt Static AsmJit)
+name: Build Android Project (Source-Built AsmJit)
 
 on:
   push:
@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
 
 jobs:
-  build-asmjit-and-app:
+  build:
     runs-on: ubuntu-latest
 
     steps:
@@ -26,36 +26,15 @@ jobs:
         with:
           ndk-version: r25c
 
-      - name: Clone AsmJit upstream at commit 594cb9e
+      - name: Fetch Matching AsmJit Source (Commit 594cb9e)
         run: |
-          git clone https://github.com/asmjit/asmjit.git /tmp/asmjit-source
-          cd /tmp/asmjit-source
-          git checkout 594cb9e
-
-      - name: Build libasmjit.a for arm64-v8a and armeabi-v7a
-        run: |
-          NDK_PATH=$ANDROID_NDK_HOME
+          # Remove broken header/source directory if present
+          rm -rf app/src/main/jni/asmjit
           
-          build_abi() {
-            ABI=$1
-            BUILD_DIR="/tmp/asmjit-build-$ABI"
-            OUT_DIR="$GITHUB_WORKSPACE/app/src/main/jni/asmjit/lib/$ABI"
-            
-            mkdir -p "$OUT_DIR"
-            
-            cmake -S /tmp/asmjit-source -B "$BUILD_DIR" \
-              -DCMAKE_TOOLCHAIN_FILE="$NDK_PATH/build/cmake/android.toolchain.cmake" \
-              -DANDROID_ABI="$ABI" \
-              -DANDROID_PLATFORM=android-21 \
-              -DCMAKE_BUILD_TYPE=Release \
-              -DASMJIT_STATIC=ON
-              
-            cmake --build "$BUILD_DIR" --config Release
-            cp "$BUILD_DIR/libasmjit.a" "$OUT_DIR/libasmjit.a"
-          }
-
-          build_abi "arm64-v8a"
-          build_abi "armeabi-v7a"
+          # Clone upstream and pin to commit 594cb9e
+          git clone https://github.com/asmjit/asmjit.git app/src/main/jni/asmjit
+          cd app/src/main/jni/asmjit
+          git checkout 594cb9e
 
       - name: Grant Execute Permission for Gradlew
         run: chmod +x gradlew
@@ -66,5 +45,5 @@ jobs:
       - name: Upload APK Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: app-release-prebuilt
+          name: app-release-source-built
           path: app/build/outputs/apk/release/*.apk
