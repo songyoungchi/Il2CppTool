@@ -22,7 +22,7 @@ on:
       asmjit_ref:
         description: "asmjit git commit/tag to build. Must be 594cb9e or a fork with AArch32 support."
         required: false
-        default: "594cb9e"   # <-- updated default
+        default: "594cb9e"
       asmjit_repo:
         description: "asmjit repository URL (optional, only used if no buildable vendored source is found)"
         required: false
@@ -118,6 +118,27 @@ jobs:
             echo "Using asmjit @ $(git -C "$SRC" rev-parse --short HEAD)"
           fi
 
+          # =====================================================================
+          # FIX: asmjit commit 594cb9e contains AArch32 (a32) source files, but
+          # its CMakeLists.txt does NOT include them in the default build.
+          # We must add all `arm/a32/*.cpp` files to the asmjit target.
+          # =====================================================================
+          A32_SOURCES="$(cd "$SRC" && find . -type f -path './asmjit/arm/a32*' -name '*.cpp' | sort)"
+          if [ -z "$A32_SOURCES" ]; then
+            echo "::error::No AArch32 source files found in asmjit commit ${{ inputs.asmjit_ref }}."
+            echo "::error::This commit may not contain the AArch32 backend. Please use a commit/fork that does."
+            exit 1
+          fi
+          echo "Found AArch32 sources, adding them to asmjit CMake target:"
+          echo "$A32_SOURCES"
+          # Convert to a CMake list of relative paths
+          CMAKE_A32_LIST=""
+          for f in $A32_SOURCES; do
+            CMAKE_A32_LIST="$CMAKE_A32_LIST \"$f\""
+          done
+          # Append to the top-level CMakeLists.txt (target asmjit must exist)
+          echo "target_sources(asmjit PRIVATE $CMAKE_A32_LIST)" >> "$SRC/CMakeLists.txt"
+
           BUILD_DIR="$(mktemp -d)"
           cmake -S "$SRC" -B "$BUILD_DIR" \
             -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake" \
@@ -136,12 +157,12 @@ jobs:
           file "$NEW_A" || true
 
           # Verify the rebuilt archive actually contains the AArch32 symbols required
-          # by this project. This is the definitive check for the link failure.
+          # by this project.
           NM="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm"
           if ! "$NM" -C "$NEW_A" | grep -q 'asmjit::_abi_1_13::a32::Assembler'; then
-            echo "::error::Rebuilt libasmjit.a does not contain a32::Assembler symbols."
-            echo "::error::The asmjit commit/configuration is missing AArch32 support."
-            echo "::error::Please use asmjit commit 594cb9e or a fork that includes the AArch32 backend."
+            echo "::error::Rebuilt libasmjit.a still does not contain a32::Assembler symbols."
+            echo "::error::Something is wrong: the AArch32 sources were added but did not produce the expected symbols."
+            echo "::error::Check the CMake configuration and source paths."
             exit 1
           fi
 
