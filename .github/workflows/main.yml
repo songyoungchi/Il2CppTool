@@ -33,6 +33,34 @@ jobs:
           ref: ${{ inputs.ref }}
           submodules: recursive   # harmless no-op if the repo turns out to have none
 
+      - name: Locate Dobby headers & prebuilt libraries
+        # armeabi-v7a fails with "'dobby.h' file not found" compiling
+        # jni/Menu/ImGui.cpp (which hooks eglSwapBuffers via Dobby), even
+        # though the arm64-v8a build finds it fine. The header itself is
+        # vendored in the repo either way - Android.mk just isn't wiring
+        # its include path up for anything but arm64-v8a. This step finds
+        # the real path at checkout time (rather than guessing it) and
+        # also surfaces whether an armeabi-v7a Dobby archive/.so actually
+        # exists, since that's the next thing that can fail (at link time)
+        # and no CI step can conjure a missing prebuilt into existence.
+        run: |
+          set -eu
+          echo "All dobby.h matches in the repo:"
+          find . -iname "dobby.h" -exec ls -la {} \; || true
+          echo
+          echo "All dobby-related .a/.so files in the repo (by ABI folder if any):"
+          find . -iname "*dobby*" \( -name "*.a" -o -name "*.so" \) -exec ls -la {} \; || true
+          echo
+
+          DOBBY_HEADER="$(find . -iname 'dobby.h' | head -n1)"
+          if [ -z "$DOBBY_HEADER" ]; then
+            echo "::error::No dobby.h found anywhere in the checked-out repo - it isn't just an Android.mk wiring issue, the header itself is missing from this checkout."
+            exit 1
+          fi
+          DOBBY_INC_DIR="$(cd "$(dirname "$DOBBY_HEADER")" && pwd)"
+          echo "Will add to include path: $DOBBY_INC_DIR"
+          echo "DOBBY_INC_DIR=$DOBBY_INC_DIR" >> "$GITHUB_ENV"
+
       - name: Install Android NDK (${{ inputs.ndk_package }})
         run: |
           set -eu
@@ -56,8 +84,11 @@ jobs:
           # line - that's how we swap the repo's default arm64-v8a /
           # android-28 for armv7 / Android 8.1 without editing Application.mk.
           # (Command-line make variables always win over the file's own
-          # APP_ABI / APP_PLATFORM assignments.)
-          ./build.sh APP_ABI=${{ inputs.abi }} APP_PLATFORM=android-${{ inputs.api_level }}
+          # APP_ABI / APP_PLATFORM assignments.) We also force-add Dobby's
+          # include dir via APP_CFLAGS, which applies to every module in
+          # the project, to work around Android.mk not exporting it for
+          # this ABI (see the "Locate Dobby" step above).
+          ./build.sh APP_ABI=${{ inputs.abi }} APP_PLATFORM=android-${{ inputs.api_level }} APP_CFLAGS="-I${DOBBY_INC_DIR}"
 
       - name: Verify build output
         run: |
