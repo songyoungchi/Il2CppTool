@@ -88,9 +88,6 @@ jobs:
           echo "asmjit tree layout:"
           find "$ASMJIT_ROOT" -maxdepth 3
 
-          # Walk upward from any vendored core/assembler.cpp looking for a
-          # CMakeLists.txt, however deeply it's nested - more robust than
-          # assuming a fixed directory depth.
           SRC=""
           LOCAL_CORE="$(find "$ASMJIT_ROOT" -iname 'assembler.cpp' -path '*core*' | head -n1)"
           if [ -n "$LOCAL_CORE" ]; then
@@ -103,19 +100,16 @@ jobs:
               CANDIDATE="$(dirname "$CANDIDATE")"
             done
 
-            # .cpp files exist locally but no CMakeLists.txt sits above them -
-            # synthesize a minimal one and build the vendored tree as-is instead
-            # of guessing at an upstream version. Guarantees ABI + backend match.
             if [ -z "$SRC" ]; then
-              VENDOR_ROOT="$(dirname "$(dirname "$LOCAL_CORE")")"   # .../asmjit/include (see tree dump)
-              cat > "$VENDOR_ROOT/CMakeLists.txt" <<'EOF'
-            cmake_minimum_required(VERSION 3.10)
-            project(vendored_asmjit CXX)
-            file(GLOB_RECURSE ASMJIT_SRC CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp")
-            add_library(asmjit STATIC ${ASMJIT_SRC})
-            target_include_directories(asmjit PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
-            target_compile_definitions(asmjit PUBLIC ASMJIT_STATIC)
-            EOF
+              VENDOR_ROOT="$(dirname "$(dirname "$LOCAL_CORE")")"
+              printf '%s\n' \
+                'cmake_minimum_required(VERSION 3.10)' \
+                'project(vendored_asmjit CXX)' \
+                'file(GLOB_RECURSE ASMJIT_SRC CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp")' \
+                'add_library(asmjit STATIC ${ASMJIT_SRC})' \
+                'target_include_directories(asmjit PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")' \
+                'target_compile_definitions(asmjit PUBLIC ASMJIT_STATIC)' \
+                > "$VENDOR_ROOT/CMakeLists.txt"
               SRC="$VENDOR_ROOT"
               echo "No CMakeLists.txt found - generated one and building the vendored source directly."
             fi
@@ -124,8 +118,6 @@ jobs:
           if [ -n "$SRC" ]; then
             echo "Building asmjit from $SRC."
           else
-            # Fallback: upstream clone. Only reached if there's genuinely no
-            # .cpp source vendored at all. Kept for completeness.
             ASMJIT_INC_DIR="$ASMJIT_ROOT/include"
             [ -d "$ASMJIT_INC_DIR" ] || ASMJIT_INC_DIR="$(find "$ASMJIT_ROOT" -type d -iname include | head -n1)"
             REQUIRED_ABI=""
