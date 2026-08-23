@@ -1,7 +1,5 @@
 name: Build libIl2CppTool (armeabi-v7a / Android 8.1)
 
-# Manual trigger only - this is an on-demand build, not CI-on-every-push.
-# Run it from the Actions tab ("Run workflow"), or via `gh workflow run`.
 on:
   workflow_dispatch:
     inputs:
@@ -35,15 +33,9 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref }}
-          submodules: recursive   # harmless no-op if the repo turns out to have none
+          submodules: recursive
 
       - name: Audit vendored prebuilt native libraries
-        # We've hit two different "vendored prebuilt only covers
-        # arm64-v8a" surprises in a row now (Dobby's header wiring, then
-        # asmjit's actual .a). Rather than find a third one the hard way,
-        # inspect every prebuilt .a/.so under jni/ up front and print what
-        # architecture each is actually built for. Also locates dobby.h
-        # for the include-path fix used in the ndk-build step later.
         run: |
           set -eu
           echo "=== Prebuilt .a archives (architecture of their .o members) ==="
@@ -77,42 +69,11 @@ jobs:
           set -eu
           SDK_ROOT="${ANDROID_SDK_ROOT:-$ANDROID_HOME}"
           SDKMANAGER="$(command -v sdkmanager || echo "$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager")"
-
-          # Accept licenses. Usually already accepted on GitHub-hosted runners,
-          # this is just a safety net so a fresh runner image doesn't stall.
           yes | "$SDKMANAGER" --licenses > /dev/null || true
-
           "$SDKMANAGER" --install "ndk;${{ inputs.ndk_package }}"
           echo "ANDROID_NDK_HOME=$SDK_ROOT/ndk/${{ inputs.ndk_package }}" >> "$GITHUB_ENV"
 
       - name: Rebuild asmjit for ${{ inputs.abi }} (vendored prebuilt is arm64-v8a only)
-        # Confirmed from a real build log: jni/asmjit/lib/libasmjit.a is a
-        # prebuilt for arm64-v8a only, at a single fixed (non-ABI-scoped)
-        # path - ld.lld's "incompatible with armelf_linux_eabi" means the
-        # object code inside is AArch64, not AArch32. No CI trick makes a
-        # missing armv7 build appear; we have to actually produce one.
-        #
-        # If the repo vendors asmjit's own buildable .cpp source next to
-        # the prebuilt, we build from that (exact match with the headers
-        # the project already compiles against). Otherwise we pull source
-        # from asmjit's own upstream repo and build it against the
-        # vendored headers. Either way we overwrite the prebuilt .a in
-        # place, so Android.mk's existing LOCAL_SRC_FILES path picks up
-        # the new one transparently.
-        #
-        # UPDATE after a second failed attempt: building plain upstream
-        # HEAD linked fine but left undefined symbols under
-        # asmjit::_abi_1_13::... - asmjit puts each release's API in a
-        # versioned inline namespace (_abi_MAJOR_MINOR) specifically to
-        # stop this kind of clash, and upstream HEAD is a newer/different
-        # tag than whatever the vendored headers here were cut from. So:
-        # extract the required "_abi_X_Y" string straight from the
-        # vendored headers, then search asmjit's own tag history
-        # (newest-first) for a released tag whose headers contain that
-        # same string, and build that exact tag - not HEAD. Verified this
-        # matching logic against a synthetic multi-tag git repo before
-        # relying on it here. An explicit asmjit_ref input still wins
-        # over auto-detection if you ever need to override it by hand.
         run: |
           set -eu
           PREBUILT_A="$(find . -iname 'libasmjit.a' | head -n1)"
@@ -141,12 +102,30 @@ jobs:
               fi
               CANDIDATE="$(dirname "$CANDIDATE")"
             done
+
+            # .cpp files exist locally but no CMakeLists.txt sits above them -
+            # synthesize a minimal one and build the vendored tree as-is instead
+            # of guessing at an upstream version. Guarantees ABI + backend match.
+            if [ -z "$SRC" ]; then
+              VENDOR_ROOT="$(dirname "$(dirname "$LOCAL_CORE")")"   # .../asmjit/include (see tree dump)
+              cat > "$VENDOR_ROOT/CMakeLists.txt" <<'EOF'
+            cmake_minimum_required(VERSION 3.10)
+            project(vendored_asmjit CXX)
+            file(GLOB_RECURSE ASMJIT_SRC CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp")
+            add_library(asmjit STATIC ${ASMJIT_SRC})
+            target_include_directories(asmjit PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
+            target_compile_definitions(asmjit PUBLIC ASMJIT_STATIC)
+            EOF
+              SRC="$VENDOR_ROOT"
+              echo "No CMakeLists.txt found - generated one and building the vendored source directly."
+            fi
           fi
 
           if [ -n "$SRC" ]; then
-            echo "Vendored buildable asmjit source found at $SRC - building from it (exact header match, no version guessing needed)."
+            echo "Building asmjit from $SRC."
           else
-            # Figure out which asmjit release the vendored headers actually are.
+            # Fallback: upstream clone. Only reached if there's genuinely no
+            # .cpp source vendored at all. Kept for completeness.
             ASMJIT_INC_DIR="$ASMJIT_ROOT/include"
             [ -d "$ASMJIT_INC_DIR" ] || ASMJIT_INC_DIR="$(find "$ASMJIT_ROOT" -type d -iname include | head -n1)"
             REQUIRED_ABI=""
@@ -205,15 +184,6 @@ jobs:
         run: |
           set -eu
           chmod +x build.sh
-          # build.sh cd's into app/src/main and calls
-          # $ANDROID_NDK_HOME/ndk-build, forwarding extra args as
-          # ndk-build / Application.mk variable overrides on the command
-          # line - that's how we swap the repo's default arm64-v8a /
-          # android-28 for armv7 / Android 8.1 without editing
-          # Application.mk (command-line make vars win over the file's
-          # own assignments). We also force-add Dobby's include dir via
-          # APP_CFLAGS, working around Android.mk not exporting it for
-          # this ABI.
           ./build.sh APP_ABI=${{ inputs.abi }} APP_PLATFORM=android-${{ inputs.api_level }} APP_CFLAGS="-I${DOBBY_INC_DIR}"
 
       - name: Verify build output
