@@ -6,14 +6,16 @@
 #include <chrono>
 #include <dlfcn.h>
 #include <cstdlib>
-#include <cstring>
+#include <filesystem>
 #include <cinttypes>
+#include <deque>
 #include <jni.h>
 #include <string>
 #include <vector>
 #include <sstream>
 #include <fstream>
 #include <unistd.h>
+#include <set>
 #include <unordered_map>
 #include "il2cpp-tabledefs.h"
 #include "il2cpp-class.h"
@@ -437,38 +439,165 @@ std::string dump_type(Il2CppType *type)
     return outPut.str();
 }
 
-void il2cpp_dump(const char *outDir, const std::function<void(const char *, int, int)> &progress)
+bool il2cpp_dump(const char *outDir, const std::function<bool(const char *, int, int)> &progress,
+                 bool *cancelled)
 {
+    // 默认按「失败」处理；只有进度回调主动返回 false 时才翻成 true。
+    // 旧实现两种情况都只是 return false，UI 一律显示「已取消」——
+    // 磁盘满也告诉用户「你按了取消」，用户会一直重试，而不去腾空间。
+    if (cancelled != nullptr)
+    {
+        *cancelled = false;
+    }
+
     LOGI("dumping...");
-    size_t size;
+    if (outDir == nullptr || *outDir == '\0')
+    {
+        LOGE("dump: 输出路径为空");
+        return false;
+    }
+    // 这里必须检查文件是否真的打开了。
+    // 旧实现 open 失败时 outStream 处于 failbit 状态，后续所有 << 都静默
+    // 什么都不做，最后照样打一条 "dump done!" —— 用户看到「完成」，
+    // 但磁盘上一个字节都没有。
+    // 直接 trunc 打开输出文件。
+    //
+    // 问题是导出过程**可能被用户中途取消**（进度界面有取消按钮），而
+    // 每次导出用的都是同一个文件名。于是「导到 40% 时取消」会把上一次
+    // 那份**完好的** .cs 截断掉 —— 用户白白重导一次，还可能没意识到
+    // 自己之前那份已经没了。
+    //
+    // 改成先写临时文件，成功结束时再改名替换：
+    //  - 取消/失败 → 临时文件被自动删除，原文件完好无损
+    //  - 成功     → rename 原子替换
+    const std::string finalPath{outDir};
+    const std::string tempPath{finalPath + ".part"};
+
+    // RAII 清理临时文件。
+    //
+    // 原注释写着「取消/失败 → 临时文件被析构删除」，但**从来没有实现**：
+    // 打开临时文件之后的每一条 return（拿不到 domain、没有 assembly、
+    // 枚举失败、用户取消、写盘出错……）都会把 .part 留在磁盘上。
+    // 于是一次取消就会留下一堆垃圾文件，累积几次之后用户会以为
+    // 「导出把存储塞满了」——而真正的原因恰恰是导出**没成功**。
+    //
+    // 成功路径在最后 rename 掉临时文件，这里 disarm 一下就不会把
+    // 刚改好的正式文件再删一遍。
+    struct TempFileCleanup
+    {
+        const std::string &path;
+        bool armed = true;
+        ~TempFileCleanup()
+        {
+            if (!armed)
+            {
+                return;
+            }
+            std::error_code ec;
+            std::filesystem::remove(path, ec);
+            if (ec)
+            {
+                LOGW("dump: 未能删除临时文件 %s: %s", path.c_str(), ec.message().c_str());
+            }
+        }
+    } tempCleanup{tempPath};
+
+    std::ofstream outStream(tempPath, std::ios::out | std::ios::trunc);
+    if (!outStream.is_open())
+    {
+        LOGE("dump: 无法打开输出文件 %s", tempPath.c_str());
+        return false;
+    }
+
+    size_t size = 0;
     auto domain = il2cpp_domain_get();
+    if (domain == nullptr || il2cpp_domain_get_assemblies == nullptr)
+    {
+        LOGE("dump: 拿不到 il2cpp domain");
+        return false;
+    }
     auto assemblies = il2cpp_domain_get_assemblies(domain, &size);
-    std::stringstream imageOutput;
-    // for (int i = 0; i < size; ++i)
-    // {
-    //     auto image = il2cpp_assembly_get_image(assemblies[i]);
-    //     imageOutput << "// Image " << i << ": " << il2cpp_image_get_name(image) << "\n";
-    // }
-    std::vector<std::string> outPuts;
+    if (assemblies == nullptr || size == 0)
+    {
+        LOGE("dump: 没有可导出的 assembly");
+        return false;
+    }
+
+    // 先把每个 image 的类数量统计出来，作为进度条的分母。
+    //
+    // 旧实现的进度是「每个 assembly 报一次」，而一个 assembly（尤其是
+    // Assembly-CSharp）内部可能有好几千个类 —— 进度条会长时间卡在 0%，
+    // 然后突然跳到 100%，用户完全不知道它在干什么。
+    //
+    // 而且中途想中止也没法中止。
+    std::vector<size_t> classCounts(size, 0);
+    size_t totalClasses = 0;
+    for (size_t i = 0; i < size; ++i)
+    {
+        auto image = il2cpp_assembly_get_image(assemblies[i]);
+        if (image == nullptr)
+        {
+            continue;
+        }
+        if (il2cpp_image_get_class)
+        {
+            classCounts[i] = (size_t)il2cpp_image_get_class_count(image);
+        }
+        totalClasses += classCounts[i];
+    }
+
+    size_t doneClasses = 0;
+    // 进度回调返回 false 表示用户要求中止。
+    auto report = [&](const char *name) -> bool
+    {
+        if (progress)
+        {
+            return progress(name, (int)doneClasses, (int)totalClasses);
+        }
+        return true;
+    };
+
     if (il2cpp_image_get_class)
     {
         LOGI("Version greater than 2018.3");
         // 使用il2cpp_image_get_class
-        for (int i = 0; i < size; ++i)
+        for (size_t i = 0; i < size; ++i)
         {
             auto image = il2cpp_assembly_get_image(assemblies[i]);
+            if (image == nullptr)
+            {
+                continue;
+            }
             std::stringstream imageStr;
             auto imageName = il2cpp_image_get_name(image);
-            progress(imageName, i, size);
-            imageStr << "\n// " << imageName << "\n";
-            auto classCount = il2cpp_image_get_class_count(image);
+            imageStr << "\n// " << (imageName ? imageName : "?") << "\n";
+
+            // 直接写文件，而不是攒在内存里最后再写。
+            //
+            // 旧实现把每个类的输出 push 进 outPuts，等全部跑完才落盘：
+            // 一次 dump 的全部 .cs 内容会同时驻留在内存里（大型游戏几百 MB），
+            // 而这个函数跑在后台线程、和游戏共享同一个进程 —— 挤占的是
+            // 用户的可用内存，OOM 时游戏先死。
+            outStream << imageStr.str();
+
+            auto classCount = (int)classCounts[i];
             for (int j = 0; j < classCount; ++j)
             {
+                // 每处理一个类就报一次进度并检查取消。
+                doneClasses++;
+                if (!report(imageName))
+                {
+                    LOGI("dump: 用户中止，已写入 %zu 个类", doneClasses);
+                    outStream.flush();
+                    return false;
+                }
                 auto klass = il2cpp_image_get_class(image, j);
+                if (klass == nullptr)
+                {
+                    continue;
+                }
                 auto type = il2cpp_class_get_type(const_cast<Il2CppClass *>(klass));
-                // LOGD("type name : %s", il2cpp_type_get_name(type));
-                auto outPut = imageStr.str() + dump_type(type);
-                outPuts.push_back(outPut);
+                outStream << dump_type(type);
             }
         }
     }
@@ -486,8 +615,8 @@ void il2cpp_dump(const char *outDir, const std::function<void(const char *, int,
         }
         else
         {
-            LOGI("miss Assembly::Load");
-            return;
+            LOGE("miss Assembly::Load");
+            return false;
         }
         if (assemblyGetTypes && assemblyGetTypes->methodPointer)
         {
@@ -495,57 +624,104 @@ void il2cpp_dump(const char *outDir, const std::function<void(const char *, int,
         }
         else
         {
-            LOGI("miss Assembly::GetTypes");
-            return;
+            LOGE("miss Assembly::GetTypes");
+            return false;
         }
         typedef void *(*Assembly_Load_ftn)(void *, Il2CppString *, void *);
-        // typedef _Il2CppArray *(*Assembly_GetTypes_ftn)(void *, void *);
         using Assembly_GetTypes_ftn = Il2CppArray<void *> *(*)(void *, void *);
-        for (int i = 0; i < size; ++i)
+        for (size_t i = 0; i < size; ++i)
         {
             auto image = il2cpp_assembly_get_image(assemblies[i]);
-            std::stringstream imageStr;
+            if (image == nullptr)
+            {
+                continue;
+            }
             auto image_name = il2cpp_image_get_name(image);
-            imageStr << "\n// " << image_name;
-            // LOGD("image name : %s", image->name);
-            auto imageName = std::string(image_name);
-            auto pos = imageName.rfind('.');
-            auto imageNameNoExt = imageName.substr(0, pos);
+            outStream << "\n// " << (image_name ? image_name : "?");
+
+            std::string imageNameStr = image_name ? image_name : "";
+            auto pos = imageNameStr.rfind('.');
+            auto imageNameNoExt = imageNameStr.substr(0, pos);
             auto assemblyFileName = il2cpp_string_new(imageNameNoExt.data());
             auto reflectionAssembly =
                 ((Assembly_Load_ftn)assemblyLoad->methodPointer)(nullptr, assemblyFileName, nullptr);
+            if (reflectionAssembly == nullptr)
+            {
+                continue;
+            }
             auto reflectionTypes =
                 ((Assembly_GetTypes_ftn)assemblyGetTypes->methodPointer)(reflectionAssembly, nullptr);
+            if (reflectionTypes == nullptr)
+            {
+                continue;
+            }
             auto items = reflectionTypes->data;
             for (int j = 0; j < reflectionTypes->max_length; ++j)
             {
+                doneClasses++;
+                if (!report(image_name))
+                {
+                    LOGI("dump: 用户中止，已写入 %zu 个类", doneClasses);
+                    outStream.flush();
+                    // 这条路径是**唯一**的「用户主动取消」。
+                    if (cancelled != nullptr)
+                    {
+                        *cancelled = true;
+                    }
+                    return false;
+                }
                 auto klass = il2cpp_class_from_system_type((Il2CppReflectionType *)items[j]);
+                if (klass == nullptr)
+                {
+                    continue;
+                }
                 auto type = il2cpp_class_get_type(klass);
-                // LOGD("type name : %s", il2cpp_type_get_name(type));
-                auto outPut = imageStr.str() + dump_type(type);
-                outPuts.push_back(outPut);
+                outStream << dump_type(type);
             }
         }
     }
-    LOGI("write dump file");
-    // auto outPath = std::string(outDir).append("/dump.cs");
-    auto outPath = std::string(outDir);
-    std::ofstream outStream(outPath);
-    outStream << imageOutput.str();
-    auto count = outPuts.size();
-    for (int i = 0; i < count; ++i)
+
+    outStream.flush();
+    if (!outStream.good())
     {
-        outStream << outPuts[i];
+        LOGE("dump: 写入 %s 时出错（存储空间不足?）", tempPath.c_str());
+        return false;
     }
     outStream.close();
-    LOGI("dump done! %s", outPath.c_str());
+
+    // 只有确认写完了，才把临时文件换成正式文件。
+    // 在此之前 cancel/失败/磁盘满，原来的 .cs 都还是完好的。
+    std::error_code ec;
+    std::filesystem::rename(tempPath, finalPath, ec);
+    if (ec)
+    {
+        // 目标已存在时 POSIX rename 是覆盖语义，不该失败；真失败就退回
+        // 「拷贝 + 删除」，再不行就报错。
+        std::filesystem::remove(finalPath, ec);
+        ec.clear();
+        std::filesystem::rename(tempPath, finalPath, ec);
+        if (ec)
+        {
+            LOGE("dump: 无法把 %s 改名为 %s: %s", tempPath.c_str(), finalPath.c_str(),
+                 ec.message().c_str());
+            return false;
+        }
+    }
+    LOGI("dump done! %s (%zu 个类)", finalPath.c_str(), doneClasses);
+    // 临时文件已经变成正式文件了，RAII 别再删它。
+    tempCleanup.armed = false;
+    return true;
 }
 
-void il2cpp_api_init(void *handle)
+bool il2cpp_api_init(void *handle)
 {
     LOGI("il2cpp_handle: %p", handle);
     init_il2cpp_api(handle);
-    if (il2cpp_domain_get_assemblies)
+    if (!il2cpp_domain_get_assemblies)
+    {
+        LOGE("Failed to initialize il2cpp api.");
+        return false;
+    }
     {
         Dl_info dlInfo;
         if (dladdr((void *)il2cpp_domain_get_assemblies, &dlInfo))
@@ -554,18 +730,37 @@ void il2cpp_api_init(void *handle)
         }
         LOGI("il2cpp_base: %" PRIx64 "", il2cpp_base);
     }
-    else
+
+    // 等游戏自己完成 il2cpp_init。必须有界：这条路径最终是在
+    // eglSwapBuffers 钩子里（即游戏的渲染线程）同步跑下来的，
+    // 原来的 while 死等一旦判断不成立就是游戏永久卡死 + ANR。
+    // 正常情况下第一次判断就该通过（能进 eglSwapBuffers 说明 il2cpp 已经起来了）。
+    //
+    // 还要先确认 il2cpp_is_vm_thread 这个符号真的解析出来了：
+    // init_il2cpp_api 对 xdl_sym 返回空是静默忽略的，Unity 版本对不上时
+    // 它可能是空函数指针，直接调用就是跳进 0 地址。
+    if (!il2cpp_is_vm_thread)
     {
-        LOGE("Failed to initialize il2cpp api.");
-        return;
+        LOGE("il2cpp_is_vm_thread 符号缺失（Unity 版本不匹配），放弃初始化");
+        return false;
     }
-    while (!il2cpp_is_vm_thread(nullptr))
+    // 等游戏自己完成 il2cpp_init。
+    //
+    // 这里只探测一次，不 sleep：整条链最终是在 eglSwapBuffers 钩子里（游戏的渲染线程）
+    // 同步跑下来的，任何 sleep 都是实打实的画面卡顿。旧代码在这里 while+sleep(1)
+    // 死等 10 秒，只要渲染线程不是 VM 线程就是一次 10 秒冻结（外加未定义行为：
+    // 未挂载的线程上调 il2cpp）。
+    //
+    // 没就绪就返回 false：调用方 on_init 会把状态置成 INIT_PENDING，
+    // 由 setupMenu 在后续帧重试（游戏照常出画面），所以不需要在这里等。
+    if (!il2cpp_is_vm_thread(nullptr))
     {
-        LOGI("Waiting for il2cpp_init...");
-        sleep(1);
+        LOGI("渲染线程尚未成为 il2cpp VM 线程，稍后重试");
+        return false;
     }
     //    auto domain = il2cpp_domain_get();
     //    il2cpp_thread_attach(domain);
+    return true;
 }
 
 bool g_DoLog = true;
@@ -652,11 +847,58 @@ namespace UnityVersion
 
 namespace Il2cpp
 {
-    void Init()
+    bool Init()
     {
         auto handle = xdl_open("libil2cpp.so", 0);
-        il2cpp_api_init(handle);
+        bool ok = il2cpp_api_init(handle);
         xdl_close(handle);
+        return ok;
+    }
+
+    bool ApiResolved()
+    {
+        // init_il2cpp_api 对 xdl_sym 返回空是静默忽略的，所以这里用几个关键
+        // 符号是否解析出来，判断「符号没找到（版本不匹配，重试无用）」还是
+        // 「运行时尚未就绪（值得稍后重试）」。
+        // 必须包含 il2cpp_is_vm_thread —— il2cpp_api_init 缺它就直接判失败，
+        // 漏掉它会把版本不匹配误判成「还没就绪」，白白重试 3600 帧。
+        return il2cpp_domain_get_assemblies != nullptr && il2cpp_class_from_name != nullptr &&
+               il2cpp_thread_current != nullptr && il2cpp_is_vm_thread != nullptr;
+    }
+
+    bool GcHandleApiResolved()
+    {
+        // NewHandle 用三个符号，少任何一个都会**静默地**返回 0（第 124 轮）。
+        //
+        // GetHandleTarget / FreeHandle 缺了也一样：liveObjects() 会因为
+        // 解析不出地址而把条目全跳过，removeAt() 会漏释放句柄。
+        return il2cpp_gchandle_new != nullptr && il2cpp_gchandle_get_target != nullptr &&
+               il2cpp_gchandle_free != nullptr;
+    }
+
+    bool BrowserApiResolved()
+    {
+        // 「打开一个类、看到它的方法列表」这条路径**实际用到**的符号。
+        //
+        // 逐个查过方法列表的渲染过程（第 125 轮）：
+        //     getMethods        il2cpp_class_get_methods
+        //     getFields         il2cpp_class_get_fields
+        //     每一行的名字       il2cpp_method_get_name
+        //     返回类型           il2cpp_method_get_return_type
+        //     参数个数/参数      il2cpp_method_get_param_count / _get_param
+        //     static 判定        il2cpp_method_is_instance
+        //     泛型实例化判定     il2cpp_method_is_inflated
+        //     类型名             il2cpp_type_get_name
+        // 这几个的包装函数都是**裸调**符号的，缺任何一个都是空指针调用。
+        //
+        // 不去查其余 234 个：那 238 个符号里绝大多数这条工具根本不碰，
+        // 挨个查只会把自检变成一份没人读的符号表。
+        // 判据是「**用户能看见的那条路径**上缺了会怎样」，不是「一共有多少个」。
+        return il2cpp_class_get_methods != nullptr && il2cpp_class_get_fields != nullptr &&
+               il2cpp_method_get_name != nullptr && il2cpp_method_get_return_type != nullptr &&
+               il2cpp_method_get_param_count != nullptr && il2cpp_method_get_param != nullptr &&
+               il2cpp_method_is_instance != nullptr && il2cpp_method_is_inflated != nullptr &&
+               il2cpp_type_get_name != nullptr;
     }
 
     void Dump(JNIEnv *env)
@@ -736,29 +978,33 @@ namespace Il2cpp
     bool EnsureAttached()
     {
         auto curr = il2cpp_thread_current();
-        if (!curr)
-        {
-            LOGI("Foreign thread!");
-        }
-        else
+        if (curr)
         {
             LOGI("Already Attached -> %p", curr);
             return true;
         }
-        LOGI("Attaching Thread");
+        LOGI("Foreign thread! Attaching");
         auto *thread = il2cpp_thread_attach(il2cpp_domain_get());
-        while (!il2cpp_is_vm_thread(thread))
-        {
-            LOGI("Waiting...");
-            sleep(1);
-        }
         if (!thread)
         {
             LOGE("Attaching Failed");
             return false;
         }
-        LOGI("Thread Attached");
-        return true;
+        // 有界等待：attach 之后 VM 线程标志需要一小段时间才可见。
+        // 旧代码在这里 while 死等，而且把 !thread 检查放在循环之后，
+        // 一旦标志迟迟不置位就会把调用线程永久挂死；后台扫描线程调这个尤其危险。
+        constexpr int kMaxWaitMs = 2000;
+        for (int waited = 0; waited < kMaxWaitMs; waited += 10)
+        {
+            if (il2cpp_is_vm_thread(thread))
+            {
+                LOGI("Thread Attached");
+                return true;
+            }
+            usleep(10 * 1000);
+        }
+        LOGE("Attaching Timed Out after %dms", kMaxWaitMs);
+        return false;
     }
 
     void Detach()
@@ -789,6 +1035,14 @@ namespace Il2cpp
 
     Il2CppImage *GetImage(Il2CppAssembly *assembly)
     {
+        // assembly 为空（模块名不对 / 元数据没就绪）时直接返回，
+        // 否则 il2cpp_assembly_get_image 会拿 0 当 this 解引用。
+        if (!assembly)
+        {
+            if (g_DoLog)
+                LOGE("GetImage: assembly 为空");
+            return nullptr;
+        }
         auto result = il2cpp_assembly_get_image(assembly);
         if (!result && g_DoLog)
             LOGE("GetImage return nullptr");
@@ -819,6 +1073,13 @@ namespace Il2cpp
             for (size_t i{0}; i < size; i++)
             {
                 auto klass = il2cpp_image_get_class(image, i);
+                // il2cpp_image_get_class 对越界/未解析的索引返回 NULL，
+                // 而「部分解析完成的 image」在 INIT_PENDING 阶段是常态。
+                // 旧代码直接 klass->getFullName() 就是空指针解引用。
+                if (klass == nullptr)
+                {
+                    continue;
+                }
                 if (klass->getFullName().compare(name) == 0)
                 {
                     result = klass;
@@ -988,6 +1249,10 @@ namespace Il2cpp
         return classes;
     }
 
+    // 缓存必须自己持有那块内存。旧实现把局部 vector 的 data() 存进缓存，
+    // 函数一返回 vector 就析构，缓存里只剩野指针 —— 任何调用者一解引用就是 UAF。
+    // 用 deque 兜住：deque 增长不会让已有元素的引用失效，元素本身之后也不再改动。
+    static std::deque<std::vector<Il2CppClass *>> subClassesStorage;
     std::unordered_map<Il2CppClass *, std::tuple<Il2CppClass **, size_t>> subClassesCache;
     const std::tuple<Il2CppClass **, size_t> &GetSubClasses(Il2CppClass *klass)
     {
@@ -1002,8 +1267,11 @@ namespace Il2cpp
         {
             subClasses.push_back(subKlass);
         }
-        subClassesCache.insert(std::make_pair(klass, std::make_tuple(subClasses.data(), subClasses.size())));
-        return subClassesCache.at(klass);
+        subClassesStorage.push_back(std::move(subClasses));
+        auto &stored = subClassesStorage.back();
+        auto [pos, inserted] = subClassesCache.emplace(
+            klass, std::make_tuple(stored.data(), stored.size()));
+        return pos->second;
     }
 
     Il2CppType *GetClassType(Il2CppClass *klass)
@@ -1142,6 +1410,18 @@ namespace Il2cpp
         return il2cpp_field_get_type(field);
     }
 
+    // 枚举的底层存储类型。C# enum 的底层可以是 byte/sbyte/short/ushort/
+    // int/uint/long/ulong，宽度不一；读值时必须按这个类型来，否则会用
+    // 4 字节的临时变量去接 8 字节的字段，把调用者的栈写坏。
+    Il2CppType *GetEnumBaseType(Il2CppClass *klass)
+    {
+        if (klass == nullptr || !il2cpp_class_enum_basetype)
+        {
+            return nullptr;
+        }
+        return il2cpp_class_enum_basetype(klass);
+    }
+
     const char *GetFieldName(FieldInfo *field)
     {
         return il2cpp_field_get_name(field);
@@ -1164,7 +1444,27 @@ namespace Il2cpp
 
     const char *GetChars(Il2CppString *str)
     {
+        if (str == nullptr || !il2cpp_string_chars)
+        {
+            return nullptr;
+        }
         return reinterpret_cast<const char *>(il2cpp_string_chars(str));
+    }
+
+    // il2cpp 托管字符串的**字符数**。
+    //
+    // 关键：il2cpp 的字符串**不是** NUL 结尾的，长度只存在 length 字段里。
+    // 想按「已知长度」读出内容就必须问 il2cpp_string_length ——
+    // 靠 NUL 扫描会一路读进托管堆，直到碰巧撞上一个 0x0000 的字为止：
+    // 轻则尾部多出一串垃圾字符（用户看到的每个字符串都被污染），
+    // 重则读过页边界直接 SIGSEGV。
+    int32_t GetStringLength(Il2CppString *str)
+    {
+        if (str == nullptr || !il2cpp_string_length)
+        {
+            return 0;
+        }
+        return il2cpp_string_length(str);
     }
 
     Il2CppString *NewString(const char *str)
@@ -1202,9 +1502,22 @@ namespace Il2cpp
         return il2cpp_runtime_invoke(method, obj, params, exc);
     }
 
-    Il2CppObject *RuntimeInvokeConvertArgs(MethodInfo *method, void *obj, Il2CppObject **params, int paramCount)
+    // 带异常出参的版本。
+    //
+    // 旧签名把 Il2CppException** 硬编码成 nullptr，于是**方法抛异常时**，
+    // 返回值是 null，UI 就显示 "the call returned null" —— 把「抛异常」
+    // 和「合法地返回 null」混为一谈。这个面板的卖点恰恰是
+    // 「查看返回值 / 异常」，说错比不说更糟。
+    //
+    // 现在让调用方能拿到异常对象自己判别。
+    Il2CppObject *RuntimeInvokeConvertArgs(MethodInfo *method, void *obj, Il2CppObject **params,
+                                           int paramCount, Il2CppException **exception)
     {
-        return il2cpp_runtime_invoke_convert_args(method, obj, params, paramCount, nullptr);
+        if (method == nullptr)
+        {
+            return nullptr;
+        }
+        return il2cpp_runtime_invoke_convert_args(method, obj, params, paramCount, exception);
     }
 
     std::tuple<Il2CppAssembly **, size_t> assembliesCache{nullptr, 0};
@@ -1234,25 +1547,142 @@ namespace Il2cpp
         return imagesCache;
     }
 
-    std::string getUnityVersion()
+    // 绕过缓存重新枚举一遍 image。
+    //
+    // 存在的理由：GetImages() 是**带缓存**的（非空就直接返回 imagesCache），
+    // 所以拿它去「检测有没有新 assembly」是**永远检测不到**的 ——
+    // 拿缓存和自己比，数量当然一样。
+    //
+    // il2cpp_domain_get_assemblies 本身返回的是域里持有的数组（不是拷贝），
+    // 这里只做一次浅拷贝，代价和 GetImages 首次调用同量级。
+    std::vector<Il2CppImage *> GetImagesFresh()
     {
-        static auto Application = FindClass("UnityEngine.Application");
-        static auto get_unityVersion = Application->getMethod("get_unityVersion");
-        if (!get_unityVersion)
+        std::vector<Il2CppImage *> fresh;
+        const auto &[ass, size] = GetAssemblies();
+        fresh.reserve(size);
+        for (size_t i = 0; i < size; i++)
         {
-            return "unknown_unity_version";
+            if (auto *img = GetImage(ass[i]))
+            {
+                fresh.push_back(img);
+            }
         }
-        static auto unityVersion = Application->invoke_static_method<Il2CppString *>("get_unityVersion");
-        if (unityVersion)
+        return fresh;
+    }
+
+    // 安全地读 UnityEngine.Application 上的一个静态字符串属性。
+    //
+    // 旧代码是 `static auto Application = FindClass("UnityEngine.Application");
+    // static auto m = Application->getMethod(...)` —— 完全没判空。
+    // 而 GC::FindObjects 的第一件事就是调 getUnityVersion()，跑在后台扫描
+    // 线程上：只要元数据被裁剪、类名对不上、或者查取得太早（Application
+    // 还没加载），FindClass 返回 null，这里就是一个必崩的空指针解引用 ——
+    // 而且崩在后台线程上，用户只看到工具「没反应」+ 游戏 ANR。
+    static std::string getApplicationString(const char *property, const char *fallback)
+    {
+        // 缓存结果：这些值在进程生命周期内不变。
+        static std::mutex cacheMutex;
+        static std::unordered_map<std::string, std::string> cache;
+        // 已经报过错的属性：失败时重试，但**只报一次**。
+        // （自检页每 2 秒读一次版本号，不限流就是每 2 秒一行 LOGE。）
+        static std::set<std::string> warnedProperties;
+        // 每个属性上次**尝试**失败的时刻（用于限流重试，见下面的说明）。
+        static std::unordered_map<std::string, double> lastFailedAttempt;
+
         {
-            static auto str = unityVersion->to_string();
-            return str;
+            std::lock_guard<std::mutex> guard(cacheMutex);
+            auto it = cache.find(property);
+            if (it != cache.end())
+            {
+                return it->second;
+            }
+        }
+
+        std::string result = fallback;
+        bool ok = false;
+        auto *Application = FindClass("UnityEngine.Application");
+        if (Application == nullptr)
+        {
+            // 统一在下面报一次
         }
         else
         {
-            LOGE("Failed to get unityVersion");
-            return "unknown_unity_version";
+            auto *method = Application->getMethod(property);
+            if (method == nullptr)
+            {
+                // 统一在下面报一次
+            }
+            else
+            {
+                try
+                {
+                    auto *value = method->invoke_static<Il2CppString *>(property);
+                    if (value)
+                    {
+                        result = value->to_string();
+                        ok = true;
+                    }
+                }
+                catch (...)
+                {
+                    // 统一在下面报一次
+                }
+            }
         }
+
+        std::lock_guard<std::mutex> guard(cacheMutex);
+        // **只缓存成功**。
+        //
+        // 这些值（Application.version / unityVersion / productName …）有可能在
+        // 游戏的静态初始化跑完**之前**就被读一次 —— 工具的 on_init 并不
+        // 保证晚于游戏的初始化。一旦那时候读失败，空结果被缓存下来，
+        // 之后每次都直接返回空 → 界面上永远是「?」，而且**没有任何办法
+        // 恢复**，除非重启游戏。
+        //
+        // 失败时改成重试。但重试要**限流**：自检页每 2 秒读一次
+        // getUnityVersion()/getGameVersion()，不限流就是每 2 秒一行 LOGE，
+        // 日志很快被刷满。所以每个属性只报一次错。
+        // 失败时改成重试。两件事都要限流：
+        //
+        //  1) **日志**每个属性只报一次（否则每 2 秒一行 LOGE 刷满）
+        //  2) **重试本身**也要退避 —— 自检页每 2 秒读一次版本号，
+        //     而每次读失败都要走一遍 FindClass("UnityEngine.Application")，
+        //     那是一次「遍历所有程序集的所有类型做名字比对」
+        //     （十万量级）。有些游戏就是没有 Application，
+        //     那它永远读不到 → 每 2 秒一次全量扫描，**永远持续下去**。
+        //     这是第 33 轮那个「失败不缓存」修复带来的长期开销，
+        //     第 38 轮的自检页把它放大了 100 倍。
+        //
+        // 退避到 30 秒封顶：真的只是「取得早」时，几秒内就恢复了；
+        // 确实没有的话，代价衰减到可忽略。
+        if (ok)
+        {
+            cache[property] = result;
+            lastFailedAttempt[property] = 0.0;
+        }
+        else
+        {
+            const double now = std::chrono::duration<double>(
+                                   std::chrono::steady_clock::now().time_since_epoch())
+                                   .count();
+            if (now - lastFailedAttempt[property] < 1.0)
+            {
+                // 刚刚才试过，别再重复扫描
+                return result;
+            }
+            lastFailedAttempt[property] = now;
+            if (warnedProperties.insert(property).second)
+            {
+                LOGE("读取 UnityEngine.Application.%s 失败，本次显示为 %s（后续会重试）",
+                     property, fallback);
+            }
+        }
+        return result;
+    }
+
+    std::string getUnityVersion()
+    {
+        return getApplicationString("get_unityVersion", "unknown_unity_version");
     }
 
     // dataPath => /storage/emulated/0/Android/data/com.dxx.firenow/files
@@ -1260,81 +1690,49 @@ namespace Il2cpp
     // version => 2.4.2
     std::string getDataPath()
     {
-        static auto Application = Il2cpp::FindClass("UnityEngine.Application");
-        static auto get_persistentDataPath = Application->getMethod("get_persistentDataPath");
-        if (!get_persistentDataPath)
-        {
-            return "unknown_data_path";
-        }
-        static auto dataPath = get_persistentDataPath->invoke_static<Il2CppString *>("get_persistentDataPath");
-        if (dataPath)
-        {
-            static auto str = dataPath->to_string();
-            return str;
-        }
-        else
-        {
-            LOGE("Failed to get dataPath");
-            return "unknown_data_path";
-        }
+        return getApplicationString("get_persistentDataPath", "unknown_data_path");
     }
     std::string getPackageName()
     {
-        static auto Application = Il2cpp::FindClass("UnityEngine.Application");
-        static auto get_identifier = Application->getMethod("get_identifier");
-        if (!get_identifier)
-        {
-            return "unknown_package_name";
-        }
-        static auto identifier = get_identifier->invoke_static<Il2CppString *>("get_identifier");
-        if (identifier)
-        {
-            static auto str = identifier->to_string();
-            return str;
-        }
-
-        else
-        {
-            LOGE("Failed to get packageName");
-            return "unknown_package_name";
-        }
+        return getApplicationString("get_identifier", "unknown_package_name");
     }
 
     std::string getGameVersion()
     {
-        static auto Application = Il2cpp::FindClass("UnityEngine.Application");
-        static auto get_version = Application->getMethod("get_version");
-        if (!get_version)
-        {
-            return "unknown_game_version";
-        }
-        static auto version = get_version->invoke_static<Il2CppString *>("get_version");
-        if (version)
-        {
-            static auto str = version->to_string();
-            return str;
-        }
-        else
-        {
-            LOGE("Failed to get game version");
-            return "unknown_game_version";
-        }
+        return getApplicationString("get_version", "unknown_game_version");
     }
     namespace GC
     {
         // TODO: handle other unity versions
         std::vector<Il2CppObject *> FindObjects(Il2CppClass *klass)
         {
-            static auto unityVersion = getUnityVersion();
-            static bool unityVersionIsBelow202120 = UnityVersion::lt(unityVersion, "2021.2.0");
+            // 不要 static 缓存 unityVersion。
+            //
+            // getApplicationString 已经改成「失败不缓存、会重试」，但这里
+            // 又用 static 把它冻结成第一次读到的值 —— **上层的一次性缓存
+            // 会把下层的修复抵消掉**。读不到版本时，
+            // UnityVersion::lt(unityVersion, "2021.2.0") 拿到的是
+            // "unknown_unity_version"，比较结果可能选错分支，
+            // 而 static 让它错到会话结束。
+            const auto unityVersion = getUnityVersion();
+            const bool unityVersionIsBelow202120 = UnityVersion::lt(unityVersion, "2021.2.0");
             LOGD("Seaching objects for %s", klass->getFullName().c_str());
 
             std::vector<Il2CppObject *> objects;
             // typedef void (*il2cpp_register_object_callback)(Il2CppObject **arr, int size, void *userdata);
+            // 这个回调是 il2cpp 通过 C 栈调进来的，绝不能让异常穿出去；
+            // 而且下面 stop_gc_world 之后一旦有异常逃出去，游戏的 GC 就永久停住（直接冻死）。
             auto callback = [](Il2CppObject **arr, int size, void *userdata)
             {
                 auto objects = reinterpret_cast<std::vector<Il2CppObject *> *>(userdata);
-                objects->insert(objects->end(), arr, arr + size);
+                try
+                {
+                    objects->insert(objects->end(), arr, arr + size);
+                }
+                catch (...)
+                {
+                    // 分配失败就少收一批，不能把异常抛回 il2cpp
+                }
             };
             if (unityVersionIsBelow202120)
             {
@@ -1376,21 +1774,109 @@ namespace Il2cpp
                         return il2cpp_alloc(size);
                     }
                 };
+                // RAII：stop_gc_world 之后必须保证 start_gc_world 一定被调用。
+                // 旧代码是顺序裸调，只要中间任何一步抛异常（分配失败、vector 扩容…）
+                // 就会带着「GC 已停」的状态退出，游戏的 GC 从此永久停摆 —— 直接冻死，
+                // 而且不会有任何报错。
+                struct GcWorldRestart
+                {
+                    bool stopped = false;
+                    ~GcWorldRestart()
+                    {
+                        if (stopped)
+                            il2cpp_start_gc_world();
+                    }
+                } worldGuard;
+
                 il2cpp_stop_gc_world();
+                worldGuard.stopped = true;
                 auto state = il2cpp_unity_liveness_allocate_struct(klass, 0, callback, &objects, realloc);
+                if (!state)
+                {
+                    LOGE("GC::FindObjects: liveness_allocate_struct 返回空");
+                    return objects; // 析构时自动重启 GC world
+                }
                 il2cpp_unity_liveness_calculation_from_statics(state);
                 il2cpp_unity_liveness_finalize(state);
                 il2cpp_start_gc_world();
+                worldGuard.stopped = false;
                 il2cpp_unity_liveness_free_struct(state);
             }
             LOGD("Found %lu objects", objects.size());
             return objects;
         }
-        // is this function actually work?
+        // 原注释就写着 "is this function actually work?" —— 现在至少
+        // 不会因为拿不到类就崩。
+        //
+        // 旧代码：
+        //     static auto SystemGC = FindClass("System.GC");
+        //     SystemGC->invoke_static_method<void>("KeepAlive", object);
+        // 同样的两个问题：判空缺失（必崩）+ static 把 null 永久缓存
+        // （早失败 = 整个会话 KeepAlive 都崩）。
+        //
+        // KeepAlive 的作用只是「让 GC 认为对象还被使用」，属于优化而非
+        // 正确性必需 —— 真正保活靠的是 GCHandle。所以拿不到类时安静
+        // 跳过、只记一条日志，是合理的降级。
         void KeepAlive(Il2CppObject *object)
         {
-            static auto SystemGC = FindClass("System.GC");
-            SystemGC->invoke_static_method<void>("KeepAlive", object);
+            if (object == nullptr)
+            {
+                return;
+            }
+            static Il2CppClass *systemGC = nullptr;
+            if (systemGC == nullptr)
+            {
+                systemGC = FindClass("System.GC");
+                if (systemGC == nullptr)
+                {
+                    LOGW("GC::KeepAlive: 找不到 System.GC，跳过（对象保活靠 GCHandle，不影响正确性）");
+                    return;
+                }
+            }
+            systemGC->invoke_static_method<void>("KeepAlive", object);
+        }
+
+        uint32_t NewHandle(Il2CppObject *object, bool pinned)
+        {
+            if (object == nullptr)
+            {
+                return 0;
+            }
+            if (!il2cpp_gchandle_new)
+            {
+                // 符号缺失（老版本 il2cpp）时不能返回 0 假装成功：
+                // 调用方会以为「已加根」，实际没有，问题会延后到随机崩溃才暴露。
+                LOGE("GC::NewHandle: il2cpp_gchandle_new 符号缺失，无法加根");
+                return 0;
+            }
+            // pinned=true 会让 GC 永不移动该对象（仅在需要稳定地址时用，
+            // 默认 false 避免让本就不紧凑的堆更碎片化）。
+            auto handle = il2cpp_gchandle_new(object, pinned);
+            if (handle == 0)
+            {
+                LOGE("GC::NewHandle: 分配 gchandle 失败");
+            }
+            return handle;
+        }
+
+        Il2CppObject *GetHandleTarget(uint32_t handle)
+        {
+            if (handle == 0 || !il2cpp_gchandle_get_target)
+            {
+                return nullptr;
+            }
+            // 对象若已被回收，il2cpp 返回 nullptr —— 这正是我们要的：
+            // 可以安全判空，而不是拿着野指针去解引用。
+            return il2cpp_gchandle_get_target(handle);
+        }
+
+        void FreeHandle(uint32_t handle)
+        {
+            if (handle == 0 || !il2cpp_gchandle_free)
+            {
+                return;
+            }
+            il2cpp_gchandle_free(handle);
         }
     } // namespace GC
 #ifdef USE_FRIDA
@@ -1476,6 +1962,22 @@ namespace Il2cpp
             //  }
         }
         static int depth;
+        // **spam 限制其实没实现。**
+        //
+        // 原设计是「同一个方法被调用超过 maxSpam 次之后就静音，避免刷屏」，
+        // 数据也传进来了（TracerData 里的 maxSpam 字段），但这个计数器
+        // 从声明到现在**从来没有被读或写过** —— 上面的 on_enter 里也没有
+        // 任何按计数静音的逻辑。
+        //
+        // 所以：即使你打开 USE_FRIDA 构建，Trace(..., maxSpam) 的
+        // maxSpam 参数也是**完全无效**的，被高频调用的方法会把日志刷爆
+        // （而 512KB 的上限会静默丢弃最早的若干行，只在「日志」页显示
+        // 丢弃行数，用户很难联想到是这个原因）。
+        //
+        // 现状下整个这一段都在 #ifdef USE_FRIDA 里，而 Android.mk 没有
+        // -DUSE_FRIDA —— 所以正式构建根本不编译它。保留是为了将来启用
+        // Frida 时用；真要启用，**maxSpam 必须先实现**，否则比不实现更糟
+        // （用户以为有限流）。
         static std::unordered_map<void *, TracerData *> spamCounter;
     };
     int TracerLintener::depth = 0;

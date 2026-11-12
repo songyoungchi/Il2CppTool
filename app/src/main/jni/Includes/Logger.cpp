@@ -1,23 +1,158 @@
 #include "Logger.h"
+#include "Utils.h"
 
-#include "Logger.h"
 #include "imgui/imgui.h"
+#include <atomic>
 #include <cstdio>
+#include <mutex>
 #include <string.h>
+#include <vector>
 
 namespace logger
 {
+    // Buf / LineOffsets 会被多个线程访问：
+    //   - 游戏线程的 hook 回调（被 hook 的方法里就能打日志）
+    //   - 后台扫描线程
+    //   - 渲染线程的 Draw / Clear
+    // 而 ImVector 在扩容时会 realloc 并释放旧缓冲 —— 渲染线程正拿着
+    // Buf.begin() 遍历时另一个线程 realloc 掉那块内存，就是堆破坏。
+    //
+    // 所以 AddLog/Clear 与 Draw 全程持锁，Draw 还在锁内把内容拷进
+    // 局部快照后再交给 ImGui 渲染：ImGui 的绘制代码会跨多帧持有
+    // 那个指针，不可能整段都锁着。
+    std::mutex g_logMutex;
     ImGuiTextBuffer Buf;
     ImGuiTextFilter Filter;
     ImVector<int> LineOffsets; // Index to lines offset. We maintain this with AddLog() calls.
     bool AutoScroll = true;    // Keep scrolling if already at the bottom.
     bool WordWrap = true;
 
+    // 缓冲区上限。
+    //
+    // ImGuiTextBuffer 是无界增长的，而且没有 erase() 可用。日志页现在接到了
+    // 界面上，而 Draw 每帧会把整个缓冲区拷进一份快照（ImGui 的绘制会跨帧
+    // 持有那个指针，没法一直持锁）。一旦调试版跑一次对象扫描攒下几 MB，
+    // 就是每帧几 MB 的拷贝 + 上传纹理，直接把渲染线程压垮。
+    //
+    // 做法：超限时整体重建，只保留尾部那几行。重建比重拷贝罕见得多
+    // （要再攒 512KB 才会再来一次），完全可接受。
+    constexpr int kMaxLogBytes = 512 * 1024;
+    int g_droppedLines = 0; // 因超限被丢弃的行数（UI 上如实告知用户）
+
+    // 因为**记不下来**而丢掉的日志条数（第 112 轮）。
+    //
+    // AddLog 现在有一层边界（它会在 catch 块里被调，抛出去就是 terminate）。
+    // catch 里必须什么都不做 —— 但「什么都不做」意味着**有一条诊断信息
+    // 悄悄没了**，而排障的人正需要它。
+    //
+    // 所以记一个数，UI 上如实显示：这和「因超限丢弃」是两回事，
+    // 前者是内存不够（很可疑），后者是 512KB 上限（正常）。
+    std::atomic<long> g_droppedWrites{0};
+
+    long DroppedWrites()
+    {
+        // 这个函数本身不会抛（就是读一个 atomic），但规则 O 是统一的：
+        // Includes/Logger.cpp 里每个函数都要有边界，**不加例外** ——
+        // 「这个函数不会抛」这种判断在代码演进中很容易失效。
+        try
+        {
+            return g_droppedWrites.load(std::memory_order_relaxed);
+        }
+        catch (...)
+        {
+            g_droppedWrites.fetch_add(1, std::memory_order_relaxed);
+            return 0;
+        }
+    }
+
+    // 注意：**调用方已经持着 g_logMutex**（AddLog 在自己的临界区里调它）。
+    //
+    // 所以这里绝对不能再去 lock —— 那是同一把非递归互斥量，
+    // 第二次 lock 直接死锁。而异常边界因此只能写 catch 块：
+    // 一旦 TrimLocked 抛出，锁会被 AddLog 的 lock_guard 释放，
+    // 但 Buf/LineOffsets 可能已经不一致 —— 那种情况下**什么都别动**，
+    // 让日志少几行，比让 Draw 切出越界的行号安全得多。
+    void TrimLocked()
+    {
+        try
+        {
+            if (Buf.size() <= kMaxLogBytes)
+            {
+                return;
+            }
+            // 找保留起点：向前越过 kMaxLogBytes，再往回找最近的换行，
+            // 保证从整行的开头开始保留。
+            int keepFrom = Buf.size() - kMaxLogBytes;
+            while (keepFrom > 0 && Buf[keepFrom - 1] != '\n')
+            {
+                keepFrom--;
+            }
+
+            std::string tail(Buf.begin() + keepFrom, Buf.begin() + Buf.size());
+
+            // 统计被丢掉的行数，供 UI 显示。
+            int dropped = 0;
+            for (int i = 0; i < keepFrom; i++)
+            {
+                if (Buf[i] == '\n')
+                {
+                    dropped++;
+                }
+            }
+            g_droppedLines += dropped;
+
+            Buf.clear();
+            LineOffsets.clear();
+            LineOffsets.push_back(0);
+            Buf.append(tail.c_str(), tail.c_str() + tail.size());
+            const char *begin = Buf.begin();
+            for (int i = 0; i < Buf.size(); i++)
+            {
+                if (begin[i] == '\n')
+                {
+                    LineOffsets.push_back(i + 1);
+                }
+            }
+        }
+        catch (...)
+        {
+            g_droppedWrites.fetch_add(1, std::memory_order_relaxed);
+            // 静默：缓冲区超限顶多让内存多占一点，
+            // 但 throw 出去会一路穿到 hook 回调里（第 112 轮）。
+        }
+    }
+
+    int DroppedLines()
+    {
+        // 异常边界（第 112 轮）：日志函数绝不能把调用方带崩。
+        // 它会在 catch 块里被调（LOGE 展开就是 AddLog），
+        // 而 catch 里抛异常 = 边展开边抛 = std::terminate。
+        try
+        {
+            std::lock_guard<std::mutex> guard(g_logMutex);
+            return g_droppedLines;
+        }
+        catch (...)
+        {
+            g_droppedWrites.fetch_add(1, std::memory_order_relaxed);
+            // 静默：记不下来就算了，日志不该有任何副作用。
+            return 0;
+        }
+    }
+
     void Clear()
     {
-        Buf.clear();
-        LineOffsets.clear();
-        LineOffsets.push_back(0);
+        try
+        {
+            std::lock_guard<std::mutex> guard(g_logMutex);
+            Buf.clear();
+            LineOffsets.clear();
+            LineOffsets.push_back(0);
+        }
+        catch (...)
+        {
+            g_droppedWrites.fetch_add(1, std::memory_order_relaxed);
+        }
     }
 
     // void AddLog(const char *fmt, ...)
@@ -34,9 +169,39 @@ namespace logger
 
     void AddLog(const char *prefix, const char *fmt, ...)
     {
+        // **整段包在边界里**（第 112 轮）—— 这是最要紧的一个。
+        //
+        // 一个日志函数必须做到：**记不下来就算了，绝不能把调用方带崩。**
+        //
+        // 为什么这么要紧：下面四样都会抛
+        //     new char[...]          bad_alloc
+        //     Buf.appendfv           内部要分配
+        //     LineOffsets.push_back  bad_alloc
+        //     TrimLocked 里的 std::string tail
+        //
+        // 而 AddLog 是从**哪里**被调的？
+        //   · hook 回调里（hookerHandler / get_touchCount / swapbuffers_hook）
+        //   · 第 110/111 轮新加的那些 **catch 块里面**
+        //
+        // 在 catch 里抛 = **边展开边抛 = std::terminate**。
+        // 也就是说：为了「异常不弄崩游戏」而加的 catch，
+        // 如果自己打日志时内存不够，会**比不加 catch 更糟**。
+        //
+        // 边界必须在这里 —— 日志是**最后一道**防线，
+        // 它自己不能再是第一个崩的地方。
+        try
+        {
+        // 整段临界区：old_size 的读取、append、扫描 '\n' 填充 LineOffsets
+        // 必须原子完成，否则 LineOffsets 会和 Buf 对不上（行号指向错位的
+        // 位置，Draw 里会切出乱码甚至越界）。
+        std::lock_guard<std::mutex> guard(g_logMutex);
+
         int old_size = Buf.size();
+        // 需要 prefix + fmt + '\n' + '\0' 四部分。
+        // 旧代码只分配了 strlen(prefix)+strlen(fmt)+1，sprintf 必然多写 1 字节
+        // （'\n' 之后还要写 '\0'），等于每次打日志都堆溢出 1 字节。
         int modifiedFmtLength = strlen(prefix) + strlen(fmt);
-        char *modifiedBuf = new char[modifiedFmtLength + 1];
+        char *modifiedBuf = new char[modifiedFmtLength + 2];
 
         sprintf(modifiedBuf, "%s%s\n", prefix, fmt);
 
@@ -49,11 +214,87 @@ namespace logger
         for (int new_size = Buf.size(); old_size < new_size; old_size++)
             if (Buf[old_size] == '\n')
                 LineOffsets.push_back(old_size + 1);
+
+        TrimLocked();
+        }
+        catch (...)
+        {
+            g_droppedWrites.fetch_add(1, std::memory_order_relaxed);
+            // 故意什么都不做：日志页丢一行，远好过把游戏带崩。
+            //
+            // 也不往 logcat 补写 —— 那会再走一遍 AddLog，递归下去
+            // 只会把同一块堆反复戳。宏里那条 __android_log_print
+            // 是独立的路，AddLog 失败时它照样会执行。
+        }
+    }
+
+    // 界面上有哪些行（供「错误数」角标用）。
+    int ErrorCount()
+    {
+        try
+        {
+            std::lock_guard<std::mutex> guard(g_logMutex);
+            const char *begin = Buf.begin();
+            int total = Buf.size();
+            int count = 0;
+            // 只扫开头那几个字节，够判断前缀是不是 "[E] " 即可。
+            for (int i = 0; i + 3 < total; i++)
+            {
+                if (Buf[i] == '\n')
+                {
+                    break;
+                }
+                if (begin[i] == '[' && begin[i + 1] == 'E' && begin[i + 2] == ']')
+                {
+                    count = 1; // 第一行就是错误
+                    break;
+                }
+            }
+            for (int i = 1; i + 3 < total; i++)
+            {
+                if (Buf[i - 1] == '\n' && begin[i] == '[' && begin[i + 1] == 'E' && begin[i + 2] == ']')
+                {
+                    count++;
+                }
+            }
+            return count;
+        }
+        catch (...)
+        {
+            g_droppedWrites.fetch_add(1, std::memory_order_relaxed);
+            return 0;
+        }
+    }
+
+    // 整个缓冲区导出成一个字符串，供「复制到剪贴板」用。
+    std::string CopyText()
+    {
+        try
+        {
+            std::lock_guard<std::mutex> guard(g_logMutex);
+            const char *begin = Buf.begin();
+            int total = Buf.size();
+            return total > 0 ? std::string(begin, begin + total) : std::string();
+        }
+        catch (...)
+        {
+            g_droppedWrites.fetch_add(1, std::memory_order_relaxed);
+            // 复制失败就是复制失败，返回空串；
+            // 绝不能在这里抛 —— 它是从界面上调的，而空串用户看得懂。
+            return std::string();
+        }
     }
 
     // NEVER CALL LOG HERE
+    //
+    // 「不要在这里调 LOG」的原因是老规矩：Draw 期间 ImGui 的窗口栈正在被
+    // 操作，中途 Begin 一堆新窗口会破坏配对。第 112 轮再加一条：
+    // Draw 本身也不许往外抛 —— 它跑在**渲染线程**上，也就是
+    // eglSwapBuffers 钩子里，抛出去和 hook 里抛出去是一个后果。
     void Draw(const char *title, bool *p_open)
     {
+        try
+        {
         // if (!ImGui::Begin(title, p_open))
         //{
         //     ImGui::End();
@@ -75,15 +316,70 @@ namespace logger
         ImGui::SameLine();
         bool clear = ImGui::Button("Clear##log");
         ImGui::SameLine();
+        if (ImGui::Button("复制全部##log"))
+        {
+            // 贴到剪贴板方便直接发 issue —— 手机上没有 adb logcat 时，
+            // 这是把诊断信息带出去的主要途径。
+            //
+            // 走 CopyToClipboard（第 118 轮）：CopyText() 本身已经有边界，
+            // 但 SetClipboardText 和「把 512KB 日志拷进剪贴板」这一步
+            // 仍然在渲染线程上，不能让异常漏到外面去。
+            std::string err;
+            if (!CopyToClipboard([]() { return CopyText(); }, &err))
+            {
+                ImGui::TextColored(ImVec4(1.f, 0.45f, 0.4f, 1.f), "%s", err.c_str());
+            }
+        }
+        if (ImGui::IsItemHovered())
+        {
+            ImGui::SetTooltip("把全部日志复制到剪贴板");
+        }
         ImGui::SameLine();
-        // Filter.Draw("Filter", -100.0f);
+        // 过滤框：出问题时能直接按关键字筛，比如只看 [E]。
+        ImGui::SetNextItemWidth(-1.0f);
+        if (ImGui::InputTextWithHint("##logfilter", "过滤（留空显示全部）", Filter.InputBuf,
+                                     IM_ARRAYSIZE(Filter.InputBuf)))
+        {
+            Filter.Build();
+        }
+        {
+            int dropped = DroppedLines();
+            if (dropped > 0)
+            {
+                // 如实告知，而不是让人以为日志莫名消失。
+                ImGui::TextColored(ImVec4(1.f, 0.85f, 0.4f, 1.f), "已丢弃最早的 %d 行（超出 512KB 上限）", dropped);
+            }
+        }
+        {
+            // 「写不进去」和「超出上限」是**两回事**，必须分开说（第 112 轮）。
+            // 后者是正常行为；前者说明内存吃紧，**排障信息正在丢失** ——
+            // 而用户此时正需要日志。这条一旦静默，工具就成了瞎子。
+            long unwritten = DroppedWrites();
+            if (unwritten > 0)
+            {
+                ImGui::TextColored(ImVec4(1.f, 0.45f, 0.4f, 1.f),
+                                   "有 %ld 条日志【没能记下来】（多半是内存不足）—— 排障信息正在丢失",
+                                   unwritten);
+            }
+        }
 
         ImGui::Separator();
 
         static float fontScale = 0.5f;
-        ImGui::SliderFloat("Scale", &fontScale, 0.1f, 1.f, "%.2f");
-        static auto font = ImGui::GetFont();
-        static auto origScale = font->Scale;
+        if (ImGui::SliderFloat("Scale", &fontScale, 0.1f, 1.f, "%.2f"))
+        {
+            // 换字体就得重取指针：原实现把 `static auto font = ImGui::GetFont()`
+            // 缓存了下来，而字体图集可能在运行期重建（「设置 → 字体」的
+            // fontFullRange 需要重启工具，但 ImGui 自身在 Scale 变化、
+            // 或 io.FontDefault 被重新指向时也会重建）。
+            // 缓存下来的 ImFont* 指向的是**已释放的图集纹理**。
+            // 每帧重取：GetFont() 只是一次指针读，代价可忽略。
+        }
+        // 关键：不能缓存。ImFont* 指向的是字体图集，图集一旦重建
+        // （改 fontFullRange、换 io.FontDefault、缩放变化）旧指针就是野的。
+        // 每帧重取，代价只是一次指针读。
+        ImFont *font = ImGui::GetFont();
+        const float origScale = font->Scale;
         font->Scale = fontScale;
         ImGui::PushFont(font);
         if (ImGui::BeginChild("scrolling", ImVec2(0, 0), false, WordWrap ? 0 : ImGuiWindowFlags_HorizontalScrollbar))
@@ -92,8 +388,45 @@ namespace logger
                 Clear();
 
             ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0, 0));
-            const char *buf = Buf.begin();
-            const char *buf_end = Buf.end();
+
+            // 关键：在锁内把内容拷进本地快照，之后再交给 ImGui。
+            // 不能直接用 Buf.begin() —— ImGui 的绘制会一直持有那个指针，
+            // 而另一个线程随时可能在 Buf 里追加日志触发 realloc，
+            // 旧缓冲被释放后 ImGui 还在读它，就是读已释放内存。
+            //
+            // 但也不能**每帧**都拷：日志页开着的时候这是每帧一次全量复制 +
+            // 纹理上传，几 MB 的缓冲区直接把渲染线程压垮。
+            // 只有内容真的变了才重拷。
+            static std::vector<char> bufSnapshot;
+            static std::vector<int> offsetsSnapshot;
+            static int lastCopiedSize = -1;
+            {
+                std::lock_guard<std::mutex> guard(g_logMutex);
+                const int total = Buf.size();
+                if (total != lastCopiedSize)
+                {
+                    const char *begin = Buf.begin();
+                    if (total > 0)
+                    {
+                        bufSnapshot.assign(begin, begin + total);
+                    }
+                    else
+                    {
+                        bufSnapshot.clear();
+                    }
+                    offsetsSnapshot.resize(LineOffsets.Size);
+                    for (int i = 0; i < LineOffsets.Size; i++)
+                    {
+                        offsetsSnapshot[i] = LineOffsets[i];
+                    }
+                    lastCopiedSize = total;
+                }
+            }
+            // 以 '\0' 结尾，满足 TextUnformatted / strncmp 的要求
+            bufSnapshot.push_back('\0');
+            const char *buf = bufSnapshot.data();
+            const char *buf_end = buf + bufSnapshot.size() - 1;
+            const int offsetCount = (int)offsetsSnapshot.size();
 
             static auto Text = [](const char *line_start, const char *line_end)
             {
@@ -118,16 +451,60 @@ namespace logger
 
             if (Filter.IsActive())
             {
-                // In this example we don't use the clipper when Filter is enabled.
-                // This is because we don't have random access to the result of our filter.
-                // A real application processing logs with ten of thousands of entries may want to store the result of
-                // search/filter.. especially if the filtering function is not trivial (e.g. reg-exp).
-                for (int line_no = 0; line_no < LineOffsets.Size; line_no++)
+                // 过滤激活时**不能**直接遍历全部行：ImGui 的官方示例在这里
+                // 明确写着「we don't use the clipper when Filter is enabled」，
+                // 代价是**每一行每一帧**都要 PassFilter 一次再画一次。
+                // 一次对象扫描能产生几万行 —— 打开日志页再输个关键字，
+                // 渲染线程就被按住了。清单 7.3 和 7.6 单独看都成立，
+                // 合起来（「过滤 + 大日志 + 不卡」）就不成立了。
+                //
+                // 官方注释给的解法就是「把过滤结果存下来」：
+                // 先扫一遍算出命中的行号，之后对**命中集**用 clipper ——
+                // 平时每帧只画可见的十几行，扫描只在内容或关键字变化时做。
+                static std::vector<int> filteredLines;
+                static std::string lastFilterKey;
+                static int lastFilterSourceSize = -1;
+
+                const std::string key = Filter.InputBuf;
+                // 只在**内容或关键字变化**时重扫一次。平时每帧零成本。
+                if (key != lastFilterKey || lastCopiedSize != lastFilterSourceSize)
                 {
-                    const char *line_start = buf + LineOffsets[line_no];
-                    const char *line_end =
-                        (line_no + 1 < LineOffsets.Size) ? (buf + LineOffsets[line_no + 1] - 1) : buf_end;
-                    Text(line_start, line_end);
+                    filteredLines.clear();
+                    for (int line_no = 0; line_no < offsetCount; line_no++)
+                    {
+                        const char *line_start = buf + offsetsSnapshot[line_no];
+                        const char *line_end =
+                            (line_no + 1 < offsetCount) ? (buf + offsetsSnapshot[line_no + 1] - 1) : buf_end;
+                        if (Filter.PassFilter(line_start, line_end))
+                        {
+                            filteredLines.push_back(line_no);
+                        }
+                    }
+                    lastFilterKey = key;
+                    lastFilterSourceSize = lastCopiedSize;
+                }
+
+                const int matchCount = (int)filteredLines.size();
+                if (matchCount == 0)
+                {
+                    ImGui::TextDisabled("没有匹配 \"%s\" 的日志行", key.c_str());
+                }
+                else
+                {
+                    ImGui::TextDisabled("匹配 %d / %d 行", matchCount, offsetCount);
+                    ImGuiListClipper clipper;
+                    clipper.Begin(matchCount);
+                    while (clipper.Step())
+                    {
+                        for (int i = clipper.DisplayStart; i < clipper.DisplayEnd; i++)
+                        {
+                            const int line_no = filteredLines[i];
+                            const char *line_start = buf + offsetsSnapshot[line_no];
+                            const char *line_end =
+                                (line_no + 1 < offsetCount) ? (buf + offsetsSnapshot[line_no + 1] - 1) : buf_end;
+                            Text(line_start, line_end);
+                        }
+                    }
                 }
             }
             else
@@ -147,14 +524,14 @@ namespace logger
                 // would make it possible (and would be recommended if you want to search through tens of thousands of
                 // entries).
                 ImGuiListClipper clipper;
-                clipper.Begin(LineOffsets.Size);
+                clipper.Begin(offsetCount);
                 while (clipper.Step())
                 {
                     for (int line_no = clipper.DisplayStart; line_no < clipper.DisplayEnd; line_no++)
                     {
-                        const char *line_start = buf + LineOffsets[line_no];
+                        const char *line_start = buf + offsetsSnapshot[line_no];
                         const char *line_end =
-                            (line_no + 1 < LineOffsets.Size) ? (buf + LineOffsets[line_no + 1] - 1) : buf_end;
+                            (line_no + 1 < offsetCount) ? (buf + offsetsSnapshot[line_no + 1] - 1) : buf_end;
                         Text(line_start, line_end);
                     }
                 }
@@ -171,5 +548,12 @@ namespace logger
         ImGui::EndChild();
         ImGui::PopFont();
         // ImGui::End();
+        }
+        catch (...)
+        {
+            g_droppedWrites.fetch_add(1, std::memory_order_relaxed);
+            // 静默。这里绝不能去平衡 Begin/End —— 出错时配对可能已经残缺，
+            // 再动只会让 ImGui 的状态更糟。下一帧重新开始即可。
+        }
     }
 }; // namespace logger

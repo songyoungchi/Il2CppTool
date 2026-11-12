@@ -1,0 +1,83 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    # 与本地开发一致：Windows + ndk-build.cmd
+    runs-on: windows-latest
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ---- NDK 版本只有一个出处：.ci/clang-tidy-baseline.txt 的 NDK-TIDY 行 ----
+      #
+      # 第 140 轮发现这里原来是「取 SDK ndk/ 目录下版本号最大的一个」，
+      # 于是 runner 上装了什么就用什么 —— 实际拿到的是 **r27.3**，
+      # 而 README 声明 r29、clang-tidy baseline 也是 r29 的产物。
+      # 三处各说各话，代码**从来没在 r29 上编译过**，
+      # baseline 里的 4 条 r29 特有告警也从来没被 CI 判过。
+      #
+      # 后果不是「编译不过」，而是更糟的：
+      # 静态分析在 r27 上跑，拿 r29 的清单去比，于是
+      # 「新增告警 = 失败」这条策略在两个版本之间**不等价**，
+      # 而且两个数字不等这件事没有任何人会发现。
+      #
+      # 规则本体在 .ci/resolve-ndk.ps1（两个 job 共用一份，
+      # 免得改了一处漏了另一处 —— 第 138 轮的教训）。
+      # -Install 让它顺带用 sdkmanager 装上缺的版本；
+      # 不用第三方 action：runner 镜像里本来就有 Android SDK。
+      - name: Install & resolve Android NDK (版本来自 baseline)
+        id: ndk
+        shell: pwsh
+        run: .\.ci\resolve-ndk.ps1 -Install
+
+      - name: Build arm64-v8a
+        shell: pwsh
+        run: .\build.ps1
+
+      - name: Verify artifact
+        shell: pwsh
+        run: |
+          $so = 'app/src/main/libs/arm64-v8a/libIl2CppTool.so'
+          if (-not (Test-Path $so)) { throw "构建产物不存在: $so" }
+          $size = (Get-Item $so).Length
+          Write-Host "libIl2CppTool.so = $size bytes"
+          if ($size -lt 1MB) { throw "构建产物异常小（$size bytes），构建可能没真正成功" }
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: libIl2CppTool-arm64-v8a
+          path: app/src/main/libs/arm64-v8a/libIl2CppTool.so
+          if-no-files-found: error
+
+  # 静态检查。工具本体是注入到别的进程里跑的崩溃型代码：
+  # 一个越界写或者空指针解引用，受害的是用户的游戏进程而不是我们。
+  # 纯编译能过不代表安全，这一层专门抓 bugprone / cert 类问题。
+  #
+  # 只检查我们自己写的源文件；imgui / asmjit / frida-gum / xdl 等
+  # 第三方代码不纳入（它们的告警既多又不由我们修）。
+  static-analysis:
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # 同一个脚本、同一个版本出处。**不带 -Install**：
+      # 静态分析只跑 clang-tidy，装错版本的后果是判据失效，
+      # 那就该立刻失败，而不是多下一个 1GB。
+      - name: Resolve Android NDK (版本来自 baseline)
+        id: ndk
+        shell: pwsh
+        run: .\.ci\resolve-ndk.ps1
+
+      - name: Pre-commit checks (single entry point)
+        shell: pwsh
+        run: .\.ci\check-all.ps1

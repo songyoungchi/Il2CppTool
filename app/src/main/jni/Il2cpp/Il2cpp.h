@@ -7,13 +7,57 @@
 
 #include "il2cpp-class.h"
 
-void il2cpp_dump(const char *outDir, const std::function<void(const char *, int, int)> &progress);
+// 导出 il2cpp 元数据到 outDir 指向的文件。
+//
+// progress(name, current, total) 每处理一个类回调一次，current/total 是
+// 跨 assembly 累计的类计数（所以进度条不会在某个大 assembly 上卡住不动）。
+// 回调返回 false 表示用户请求中止 —— 这也是唯一能在中途停下来的时机。
+//
+// 直接流式写盘，不在内存里累积整个 .cs 内容。
+// 返回 false 表示失败或被用户中止（此时文件里是**不完整**的内容）。
+/**
+ * 导出 il2cpp 类型树为 .cs。
+ *
+ * progress 回调返回 false 表示请求中止（用户点了取消）。
+ * 返回 false 时，通过 cancelled 出参区分「用户主动取消」和
+ * 「真的出错了（磁盘满、写不了文件）」—— 这两件事给用户的处置
+ * 完全不同：前者不用管，后者得先去腾空间。
+ * 出参可为 nullptr。
+ */
+bool il2cpp_dump(const char *outDir, const std::function<bool(const char *, int, int)> &progress,
+                 bool *cancelled = nullptr);
 
 namespace Il2cpp
 {
     //@formatter:off
 
-    void Init();
+    // 返回 false 表示 il2cpp 尚未就绪（API 表没解析出来，或等待 il2cpp_init 超时）。
+    // 调用方必须检查并放弃后续初始化，否则会在空指针上继续往下走。
+    bool Init();
+    // 区分 Init() 失败的两种原因：
+    // - true  = API 表已经解析出来了，只是运行时尚未就绪 → 值得稍后重试
+    // - false = 连符号都没解析出来（版本不匹配等）→ 重试也没用
+    bool ApiResolved();
+    // GC 句柄那三个符号是否都解析出来了（第 124 轮）。
+    //
+    // **必须**和 ApiResolved() 分开报，因为后果完全不同：
+    // ApiResolved() 少了 gchandle 符号，而别的符号都在时，它照样返回 true，
+    // 自检会说「il2cpp API 已解析」。而这时 NewHandle 对**每一个**对象
+    // 都返回 0，liveObjects() 把它们全跳过 —— 表现是
+    // 「Find Objects 秒完成，一个都没找到」。
+    //
+    // 而 il2cpp_gchandle_new 是老版本 il2cpp 上就可能缺的符号，
+    // 也就是说这不是理论问题。
+    bool GcHandleApiResolved();
+    // 「浏览类和方法」这条主路径需要的符号是否都解析出来了（第 125 轮）。
+    //
+    // 这一项和 GcHandleApiResolved 的**危险程度不同**：
+    // gchandle 缺了是「静默少东西」，而这里缺了是**直接崩游戏** ——
+    // `GetIsMethodInflated()` 之类的包装函数是**裸调**符号的，
+    // 符号为空就是空指针调用，方法列表一画就 SIGSEGV。
+    //
+    // 那边是「错了但你不知道」，这边是「当场崩」，所以必须提前查出来。
+    bool BrowserApiResolved();
     // void Dump(JavaVM *jvm);
     void Dump(JNIEnv *env);
     bool EnsureAttached();
@@ -32,7 +76,11 @@ namespace Il2cpp
     Il2CppAssembly *GetAssembly(const char *name);
     Il2CppClass *GetClass(Il2CppImage *image, const char *name);
     const std::tuple<Il2CppAssembly **, size_t> &GetAssemblies();
+    // 注意：这是**带缓存**的（非空就直接返回缓存）。要检测运行时新加载的
+    // assembly 必须用 GetImagesFresh() —— 用它去「看有没有变」永远看不到变化。
     const std::vector<Il2CppImage *> &GetImages();
+    // 绕过缓存重新枚举。用于「检测动态加载的 assembly」。
+    std::vector<Il2CppImage *> GetImagesFresh();
 
     // class
     FieldInfo *GetClassField(Il2CppClass *klass, const char *fieldName);
@@ -89,6 +137,9 @@ namespace Il2cpp
     void SetFieldValueObject(Il2CppObject *object, FieldInfo *field, Il2CppObject *newValue);
     uintptr_t GetFieldOffset(FieldInfo *field);
     Il2CppType *GetFieldType(FieldInfo *field);
+
+    // 枚举的底层存储类型（byte/short/int/long…）。读枚举值必须按它取宽度。
+    Il2CppType *GetEnumBaseType(Il2CppClass *klass);
     const char *GetFieldName(FieldInfo *field);
     int GetFieldFlags(FieldInfo *field);
 
@@ -102,6 +153,12 @@ namespace Il2cpp
 
     // string
     const char *GetChars(Il2CppString *str); // returns wide char
+    // il2cpp 托管字符串的字符数。
+    //
+    // 字符串**不是** NUL 结尾的（长度只在 length 字段里），所以要按已知
+    // 长度读内容就必须用它。靠 NUL 扫描会读进托管堆直到碰巧撞上零字 ——
+    // 用户看到的是尾部多出垃圾字符，或者直接读过页边界崩掉。
+    int32_t GetStringLength(Il2CppString *str);
     Il2CppString *NewString(const char *str);
 
     // array
@@ -117,6 +174,266 @@ namespace Il2cpp
     {
         std::vector<Il2CppObject *> FindObjects(Il2CppClass *klass);
         void KeepAlive(Il2CppObject *object);
+
+        // ---- 强引用（GCHandle）----
+        //
+        // 工具会在很多地方长期缓存托管对象（选中要画 ESP 的 GameObject、
+        // 调用结果、扫描出来的实例……），但那些都是裸 Il2CppObject*。
+        // 托管侧一旦没有引用者，GC 就会回收它们，之后我们手上的指针是野的 ——
+        // 而且 IsNativeObjectAlive 这类检查本身也要先解引用指针才能调用，
+        // 所以「先判断再用」是防不住的。
+        //
+        // 正确做法是给缓存的对象加一个强 GCHandle：GC 会把它当作根，
+        // 只要我们不释放，对象就一直活着。get() 在对象已被回收时返回
+        // nullptr（而不是野指针），可以安全地判空。
+        //
+        // 注意：GCHandle 是「引用计数式资源」，必须与缓存一一对应释放，
+        // 否则对象永远收不掉（内存泄漏）。Release 之后再 get() 返回 null。
+        uint32_t NewHandle(Il2CppObject *object, bool pinned = false);
+        Il2CppObject *GetHandleTarget(uint32_t handle);
+        void FreeHandle(uint32_t handle);
+
+        // RAII 包装：析构时自动 FreeHandle。
+        // 适合「函数内临时保活」这类场景。
+        class ScopedHandle
+        {
+          public:
+            ScopedHandle() = default;
+            explicit ScopedHandle(Il2CppObject *object, bool pinned = false)
+            {
+                reset(object, pinned);
+            }
+            ScopedHandle(const ScopedHandle &) = delete;
+            ScopedHandle &operator=(const ScopedHandle &) = delete;
+            ScopedHandle(ScopedHandle &&other) noexcept
+                : m_handle(other.m_handle)
+            {
+                other.m_handle = 0;
+            }
+            ScopedHandle &operator=(ScopedHandle &&other) noexcept
+            {
+                if (this != &other)
+                {
+                    release();
+                    m_handle = other.m_handle;
+                    other.m_handle = 0;
+                }
+                return *this;
+            }
+            ~ScopedHandle()
+            {
+                release();
+            }
+
+            void reset(Il2CppObject *object, bool pinned = false)
+            {
+                release();
+                m_handle = object ? NewHandle(object, pinned) : 0;
+            }
+            void release()
+            {
+                if (m_handle)
+                {
+                    FreeHandle(m_handle);
+                    m_handle = 0;
+                }
+            }
+            uint32_t get() const
+            {
+                return m_handle;
+            }
+            Il2CppObject *target() const
+            {
+                return m_handle ? GetHandleTarget(m_handle) : nullptr;
+            }
+            explicit operator bool() const
+            {
+                return m_handle != 0;
+            }
+
+          private:
+            uint32_t m_handle = 0;
+        };
+
+        // 一组被强引用的对象。
+        //
+        // 用于「工具会长期缓存一批对象」的场景：条目存活期间 GC 不会回收它们，
+        // 条目销毁时自动释放句柄。和 ScopedHandle 一样是 move-only ——
+        // 句柄只能有一个主人，浅拷贝会 double free 把 GC 句柄表写坏。
+        class RootedObjectList
+        {
+          public:
+            RootedObjectList() = default;
+            explicit RootedObjectList(std::vector<Il2CppObject *> objects)
+            {
+                reset(std::move(objects));
+            }
+            RootedObjectList(const RootedObjectList &) = delete;
+            RootedObjectList &operator=(const RootedObjectList &) = delete;
+            RootedObjectList(RootedObjectList &&other) noexcept
+            {
+                swap(other);
+            }
+            RootedObjectList &operator=(RootedObjectList &&other) noexcept
+            {
+                if (this != &other)
+                {
+                    reset();
+                    swap(other);
+                }
+                return *this;
+            }
+            ~RootedObjectList()
+            {
+                reset();
+            }
+
+            // 接管一批对象并逐个加根。会先释放自己原有的句柄。
+            void reset(std::vector<Il2CppObject *> objects = {})
+            {
+                releaseHandles();
+                m_objects = std::move(objects);
+                m_handles.clear();
+                m_handles.reserve(m_objects.size());
+                for (auto *obj : m_objects)
+                {
+                    m_handles.push_back(obj ? NewHandle(obj) : 0);
+                }
+            }
+
+            // 丢掉所有对象和句柄
+            void releaseHandles()
+            {
+                for (auto handle : m_handles)
+                {
+                    if (handle)
+                    {
+                        FreeHandle(handle);
+                    }
+                }
+                m_handles.clear();
+                m_objects.clear();
+            }
+
+            // 只返回仍然有效的对象。
+            //
+            // 关键：有效性必须由**句柄**回答，不能直接看 m_objects 里的裸指针。
+            // 对象被回收后那个地址已经是野的，去解引用它就崩了。
+            // 顺带把已失效的条目就地剔除（并释放其句柄），避免列表无限膨胀。
+            std::vector<Il2CppObject *> liveObjects()
+            {
+                std::vector<Il2CppObject *> out;
+                out.reserve(m_objects.size());
+                for (size_t i = 0; i < m_objects.size(); i++)
+                {
+                    // **句柄为 0 就跳过**，不退回 m_objects[i]（第 101 轮改）。
+                    //
+                    // reset()/add() 里 `NewHandle` 失败时会存一个 0 句柄
+                    // （它们不能直接失败退出 —— 那会让整个类的对象列表凭空消失）。
+                    // 而这个三元表达式的 else 分支正是「加根失败 → 退回裸指针」，
+                    // 于是调用方拿到一个**没有根的地址**去解引用。
+                    //
+                    // 这是同一个 bug 的第三个地方：
+                    //   ResolveGameObject  return info.gameObject;   (98 轮)
+                    //   ResolveSaved       return obj;               (99 轮)
+                    //   liveObjects        : m_objects[i]            (101 轮)
+                    // 前两个被规则 J 抓到了，这个没抓到 —— 因为它不是 return，
+                    // 是三元表达式。规则 J 因此也扩了（第 101 轮）。
+                    if (!m_handles[i])
+                    {
+                        continue; // 没加根成功：不认识它，也不碰它
+                    }
+                    auto *obj = GetHandleTarget(m_handles[i]);
+                    if (obj == nullptr)
+                    {
+                        if (m_handles[i])
+                        {
+                            FreeHandle(m_handles[i]);
+                        }
+                        continue;
+                    }
+                    // 句柄解析出的地址可能与缓存的原始地址不同（对象被移动过），
+                    // 同步更新，后续调用一律用新地址。
+                    m_objects[i] = obj;
+                    out.push_back(obj);
+                }
+                return out;
+            }
+
+            // 追加一个对象并为它加根。
+            void add(Il2CppObject *object)
+            {
+                m_objects.push_back(object);
+                m_handles.push_back(object ? NewHandle(object) : 0);
+            }
+
+            // 这一批里有几个**没能加根**（第 124 轮）。
+            //
+            // 加根失败的对象会被 liveObjects() 静默跳过 —— 从「不崩」的角度
+            // 那是对的，可从「用户知道发生了什么」的角度是错的：
+            // 列表凭空少了一批，而没有任何一个字说明少了。
+            // 所以把这个数记下来，由调用方报给用户。
+            //
+            // 注意它是**累计值**而不是「本批失败数」：liveObjects() 每帧
+            // 都会剔除已失效的条目，而 add() 之后的失败只发生在新增那一刻，
+            // 混在一起会越滚越大。要「本批」的数就在 reset() 前后各取一次差值。
+            size_t rootFailures() const
+            {
+                size_t bad = 0;
+                for (auto handle : m_handles)
+                {
+                    if (!handle)
+                    {
+                        bad++;
+                    }
+                }
+                return bad;
+            }
+
+            // 删除第 index 个对象并释放其句柄。
+            // 必须同时删两个数组 —— 句柄和对象一一对应，错位了就等于
+            // 拿 A 对象的句柄去保 B 对象（后者照样被回收）或重复释放。
+            void removeAt(size_t index)
+            {
+                if (index >= m_objects.size())
+                {
+                    return;
+                }
+                if (m_handles[index])
+                {
+                    FreeHandle(m_handles[index]);
+                }
+                m_objects.erase(m_objects.begin() + index);
+                if (index < m_handles.size())
+                {
+                    m_handles.erase(m_handles.begin() + index);
+                }
+            }
+
+            const std::vector<Il2CppObject *> &raw() const
+            {
+                return m_objects;
+            }
+            size_t size() const
+            {
+                return m_objects.size();
+            }
+            bool empty() const
+            {
+                return m_objects.empty();
+            }
+            void swap(RootedObjectList &other) noexcept
+            {
+                m_objects.swap(other.m_objects);
+                m_handles.swap(other.m_handles);
+            }
+
+          private:
+            std::vector<Il2CppObject *> m_objects;
+            // 与 m_objects 一一对应的句柄。拿不到句柄时（0）退化成裸指针并
+            // 照常工作 —— 不会因此崩，只是失去了 GC 保活保证。
+            std::vector<uint32_t> m_handles;
+        };
     } // namespace GC
 
     // other
@@ -129,7 +446,10 @@ namespace Il2cpp
         return *static_cast<T *>(value);
     }
     Il2CppObject *RuntimeInvoke(MethodInfo *method, void *obj, void **params, Il2CppException **exc);
-    Il2CppObject *RuntimeInvokeConvertArgs(MethodInfo *method, void *obj, Il2CppObject **params, int paramCount);
+    // exception 可为 nullptr（不关心异常），也可以传一个 Il2CppException* 变量
+    // 的地址，用来区分「方法抛了异常」和「合法地返回 null」。
+    Il2CppObject *RuntimeInvokeConvertArgs(MethodInfo *method, void *obj, Il2CppObject **params,
+                                           int paramCount, Il2CppException **exception = nullptr);
 #if __DEBUG__
     // this is a Debug function, it should be used as a tool only
     void Trace(Il2CppImage *image, std::function<bool(Il2CppClass *)> filterClasses,

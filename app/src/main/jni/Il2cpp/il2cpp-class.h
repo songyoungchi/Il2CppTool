@@ -207,6 +207,12 @@ struct MethodInfo
     template <typename T, typename... Args>
     T invoke(Il2CppObject *instance);
 
+  public:
+    // 卸 hook 时必须配对调用，否则这张表会留下失效的 trampoline 记录，
+    // 导致同一个方法之后无法重新 hook（_isAlreadyHooked 会挡掉并返回 nullptr）。
+    static void _removeFromHookedMap(uintptr_t ptr);
+
+  private:
     static bool _isAlreadyHooked(uintptr_t ptr);
 
     static void _addToHookedMap(uintptr_t ptr, uintptr_t oPtr);
@@ -261,7 +267,8 @@ struct Il2CppObject
 };
 
 void AddCustomDumpHandler(std::function<nlohmann::ordered_json(Il2CppObject *, Il2CppType *, size_t)> handler);
-void ChangeMaxListArraySize(size_t size, std::function<void()> callback);
+// 临时调高列表/数组展开上限，跑完 callback 自动恢复（异常安全）。
+void ChangeMaxListArraySize(int size, std::function<void()> callback);
 
 struct _Il2CppArray : Il2CppObject
 {
@@ -300,6 +307,20 @@ struct Il2CppClass
     MethodInfo *findMethod(const char *name, size_t idx = 0);
 
     FieldInfo *getField(const char *fieldName);
+    // 沿继承链找字段（先自己，再逐级父类）。
+    //
+    // getField 是 **单类** 查找（il2cpp_class_get_field_from_name），
+    // 继承来的字段一律返回 null。但本项目的 getFields(includeParents=true)
+    // 是会枚举父类字段的 —— 于是出现一个很糟的不一致：
+    // **继承字段会出现在 dump 出来的 JSON 里，点进去却打不开。**
+    // 用户看到字段有值，展开却报「对象已失效」，完全不知道发生了什么。
+    //
+    // getField<T> 那边更糟：找不到就 LOGW 一句然后**返回默认值** ——
+    // 读一个继承字段静默拿到 0，而不是报错。
+    //
+    // 所以凡是「按名字取字段」的地方都该用这个。FieldInfo 里的偏移是
+    // 绝对偏移，拿到之后直接用即可，不需要自己加什么。
+    FieldInfo *getFieldInHierarchy(const char *fieldName);
 
     std::vector<FieldInfo *> getFields(bool includeParents = false);
 
@@ -327,11 +348,18 @@ struct Il2CppClass
 
 struct FieldInfo
 {
-
+    // 注意：il2cpp_field_get_value / _static_get_value 会写入
+    // **field->type 的 data_size 字节**，与 T 的大小无关。
+    // 拿 int 去读一个 8 字节的枚举/字段，运行时就会往 4 字节的栈变量上写
+    // 8 字节 —— 直接踩坏调用者的栈帧。T 比字段窄时还会把未初始化的
+    // 高位字节当成值返回。
+    //
+    // 所以：只在类型宽度确定匹配时用这两个模板。要读枚举请用
+    // getEnumValue()，它会按真实底层类型取值。
     template <typename T>
     T getValue(Il2CppObject *instance)
     {
-        T value;
+        T value{};
         Il2cpp::GetFieldValue(instance, this, &value);
         return value;
     }
@@ -339,10 +367,18 @@ struct FieldInfo
     template <typename T>
     T getStaticValue()
     {
-        T value;
+        T value{};
         Il2cpp::GetFieldStaticValue(this, &value);
         return value;
     }
+
+    // 按底层类型宽度读枚举静态成员（MyEnum.Foo）的值。
+    // 返回 int64_t：uint64 底色的成员用位模式承载。
+    //
+    // 为什么不能直接 getStaticValue<int>()：il2cpp 会按字段的真实宽度写入，
+    // C# enum 底层可以是 long/ulong（8 字节），用 4 字节变量去接就是往
+    // 调用者栈上多写 4 字节 —— 直接破坏栈帧。
+    static int64_t getEnumStaticValue(FieldInfo *field);
 
     template <typename T>
     void setValue(Il2CppObject *instance, T value)
@@ -368,9 +404,13 @@ struct Il2CppString : Il2CppObject
     //    int32_t len;
     //    char chars[32];
 
+    // 唯一的取值接口。
+    //
+    // 旧声明里还有一个 `const char *to_char();` —— **从未实现**，也没有任何
+    // 调用点，而它的签名看起来正好是「把托管字符串转成 C 字符串」。
+    // 下一个人很可能顺手调它，然后拿到指向 **UTF-16** 缓冲区的指针，
+    // 中文全变乱码。第 102 轮扫出来，第 103 轮删掉（第 103 轮）。
     std::string to_string();
-
-    const char *to_char();
 };
 
 template <typename T>
@@ -411,6 +451,16 @@ struct BigDouble
 template <typename T>
 T Il2CppObject::invoke_method(MethodInfo *method)
 {
+    // 和按名字的重载保持一致：名字版会判空并返回 T{}，
+    // 这个 MethodInfo* 版以前直接 method->invoke<T>()，传 null 就是空指针解引用。
+    if (method == nullptr)
+    {
+        LOGW("invoke_method: null MethodInfo, skipped");
+        if constexpr (!std::is_void_v<T>)
+            return T{};
+        else
+            return;
+    }
     return method->invoke<T>(this);
 }
 
@@ -453,13 +503,25 @@ T Il2CppObject::invoke_method(MethodInfo *method, Args &&...args)
 template <typename T>
 void *MethodInfo::replace(T func)
 {
+    if (methodPointer == nullptr)
+    {
+        LOGE("replace: methodPointer 为空，拒绝 hook");
+        return nullptr;
+    }
     if (_isAlreadyHooked((uintptr_t)methodPointer))
     {
         LOGD("Already hooked");
         return nullptr;
     }
-    void *orig;
-    DobbyHook(methodPointer, (void *)func, &orig);
+    // 必须初始化并检查 DobbyHook 的返回值：旧代码忽略返回值，
+    // hook 失败时 orig 是未初始化值，还会把垃圾登记进 hooked map；
+    // 调用方再把 orig 赋给 o_xxx 原函数指针，游戏一调就跳进野地址。
+    void *orig = nullptr;
+    if (DobbyHook(methodPointer, (void *)func, &orig) != 0)
+    {
+        LOGE("replace: DobbyHook 失败 %s", getName() ? getName() : "?");
+        return nullptr;
+    }
     _addToHookedMap((uintptr_t)methodPointer, (uintptr_t)orig);
     return orig;
 }
@@ -478,7 +540,32 @@ T MethodInfo::invoke_static(Args... args)
     using Invoker = T (*)(Args..., MethodInfo *);
     auto address = _getHookedMap((uintptr_t)this->methodPointer);
     auto invoker = reinterpret_cast<Invoker>(address);
-    return invoker(std::forward<Args>(args)..., this);
+    // 异常边界（第 110 轮）。
+    //
+    // 下面这一行是**进托管代码**。托管那边抛的异常（`GetTouch(0)` 在
+    // 手指已经收回去时会抛 IndexOutOfRange/Argument）会被 il2cpp 翻成
+    // C++ 异常；而**调用方通常没有任何边界** ——
+    // 尤其 `get_touchCount` 那个 hook 跑在游戏的输入路径上，
+    // 异常一路逃出去就是整局游戏崩掉。
+    //
+    // 放在这里而不是各个调用点，是因为这里是**唯一**的收口：
+    // 五个调用点里只有一个（Unity.cpp）会崩游戏，但它记不住自己崩过。
+    try
+    {
+        return invoker(std::forward<Args>(args)..., this);
+    }
+    catch (const std::exception &e)
+    {
+        LOGE("invoke_static(%s): 托管调用抛出异常: %s", getName() ? getName() : "?", e.what());
+    }
+    catch (...)
+    {
+        LOGE("invoke_static(%s): 托管调用抛出未知异常", getName() ? getName() : "?");
+    }
+    if constexpr (!std::is_void_v<T>)
+        return T{};
+    else
+        return;
 }
 
 template <typename T, typename... Args>
@@ -495,7 +582,24 @@ T MethodInfo::invoke(Il2CppObject *instance)
     using Invoker = T (*)(Il2CppObject *, MethodInfo *);
     auto address = _getHookedMap((uintptr_t)this->methodPointer);
     auto invoker = reinterpret_cast<Invoker>(address);
-    return invoker(instance, this);
+    // 异常边界 —— 和上面两个 invoke 同理（第 110 轮）。
+    // 三个重载都必须包：只包两个的话，第三个调用点照样能把游戏带崩。
+    try
+    {
+        return invoker(instance, this);
+    }
+    catch (const std::exception &e)
+    {
+        LOGE("invoke(%s): 托管调用抛出异常: %s", getName() ? getName() : "?", e.what());
+    }
+    catch (...)
+    {
+        LOGE("invoke(%s): 托管调用抛出未知异常", getName() ? getName() : "?");
+    }
+    if constexpr (!std::is_void_v<T>)
+        return T{};
+    else
+        return;
 }
 
 template <typename T, typename... Args>
@@ -512,23 +616,59 @@ T MethodInfo::invoke(Il2CppObject *instance, Args &&...args)
     using Invoker = T (*)(Il2CppObject *, Args..., MethodInfo *);
     auto address = _getHookedMap((uintptr_t)this->methodPointer);
     auto invoker = reinterpret_cast<Invoker>(address);
-    return invoker(instance, std::forward<Args>(args)..., this);
+    // 异常边界 —— 和 invoke_static 同理（第 110 轮）：
+    // 这一行进托管代码，异常会被 il2cpp 翻成 C++ 异常，
+    // 而调用方（尤其 hook 路径上的那些）通常没有边界。
+    try
+    {
+        return invoker(instance, std::forward<Args>(args)..., this);
+    }
+    catch (const std::exception &e)
+    {
+        LOGE("invoke(%s): 托管调用抛出异常: %s", getName() ? getName() : "?", e.what());
+    }
+    catch (...)
+    {
+        LOGE("invoke(%s): 托管调用抛出未知异常", getName() ? getName() : "?");
+    }
+    if constexpr (!std::is_void_v<T>)
+        return T{};
+    else
+        return;
 }
 
 template <typename T>
 T Il2CppObject::getField(const char *name)
 {
-    auto field = klass->getField(name);
+    auto field = klass ? klass->getFieldInHierarchy(name) : nullptr;
+    // 字段可能不存在（改名/裁剪过元数据）。
+    // 旧代码直接 field->getValue<T>() 就是空指针解引用。
+    //
+    // 用 getFieldInHierarchy 而不是 getField：后者是**单类**查找，
+    // 读继承来的字段会返回 null，于是落到下面的「返回默认值」分支 ——
+    // 用户读一个继承字段静默拿到 0，看起来就像「这个字段本来就是 0」，
+    // 比报错更糟。
+    if (field == nullptr)
+    {
+        LOGW("getField: 找不到字段 %s（已沿继承链查找），返回默认值", name);
+        if constexpr (!std::is_void_v<T>)
+            return T{};
+        else
+            return;
+    }
     return field->getValue<T>(this);
-    //        auto offset = _getFieldOffset(name);
-    //        return (T) _getField(name);
-    //        return (T) (this + offset);
 }
 
 template <typename T>
 void Il2CppObject::setField(const char *name, T newValue)
 {
-    auto field = klass->getField(name);
+    auto field = klass ? klass->getFieldInHierarchy(name) : nullptr;
+    // 同 getField：沿继承链找，否则写不进继承来的字段。
+    if (field == nullptr)
+    {
+        LOGW("setField: 找不到字段 %s（已沿继承链查找），写入被忽略", name);
+        return;
+    }
     return field->setValue<T>(this, newValue);
 }
 

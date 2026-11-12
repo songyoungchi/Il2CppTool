@@ -93,3 +93,18 @@ compile_commands.json
 
 # ndk-build 原生构建产物（app/src/main/obj 已被上方 obj/ 覆盖，这里再加 libs/ 输出）
 app/src/main/libs/
+
+# 本地分析样本：目标游戏的 libil2cpp.so（~80MB，只是拿来离线看符号用的，不进版本控制）
+Lib/
+
+# Kilo 编辑器工作区（含 node_modules 与 worktree）
+.kilo/
+
+# 门禁自检的缓存（每次绿了才写，机器本地状态，不进版本库）
+.ci/.selftest-cache
+
+# DSH 记忆库落盘位置（我的工作笔记，不是项目代码）
+.dsh-meow/
+
+# build.ps1 生成的版本头（版本号唯一出处是 VERSION.txt，见 docs/版本号.md）
+app/src/main/jni/Includes/Version.h

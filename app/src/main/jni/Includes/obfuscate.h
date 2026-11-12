@@ -21,7 +21,9 @@ Example:
 const char* obfuscated_string = AY_OBFUSCATE("Hello World");
 std::cout << obfuscated_string << std::endl;
 ----------------------------------------------------------------------------- */
+#include <atomic>
 #include <cstddef>
+#include <mutex>
 #include <string>
 
 #ifndef AY_OBFUSCATE_DEFAULT_KEY
@@ -103,6 +105,31 @@ namespace ay
     };
 
     // Handles decryption and re-encryption of an encrypted string at runtime
+    //
+    // 所有 obfuscated_data 实例共用一把锁。
+    // 单独给每个实例配一个 mutex 会让对象不能拷贝、且体积变大，
+    // 而临界区只有几十字节的 XOR，没必要。
+    //
+    // 关键：这把锁**故意永不析构**。
+    //
+    // OBFUSCATE 宏展开成「函数内 static obfuscated_data」，它的析构函数
+    // 会在**库卸载**时（.fini_array / __cxa_atexit）运行，而析构里要拿这把锁。
+    // 如果锁本身是个普通 static，它的析构顺序和那些 obfuscated_data 之间的
+    // 先后是**不确定的**（跨翻译单元更没保证）。一旦锁先被析构，
+    // 之后再去 lock 一个已析构的 mutex 就是 UB —— 在 pthread 实现上
+    // 轻则死锁、重则崩溃。
+    //
+    // 而且现象极其难查：只在**游戏退出**时触发，表现为「退出时偶发卡死/崩溃」，
+    // 和工具功能毫无关联。
+    //
+    // 故意泄漏一个：整个进程生命周期内有效，进程退出时由内核回收。
+    // 代价是这一小块内存在进程结束前不归还 —— 可以忽略。
+    inline std::mutex &obfuscateMutex()
+    {
+        static std::mutex *m = new std::mutex();
+        return *m;
+    }
+
     template <size_type N, key_type KEY>
     class obfuscated_data
     {
@@ -118,7 +145,10 @@ namespace ay
 
         ~obfuscated_data()
         {
-            // Zero m_data to remove it from memory
+            // Zero m_data to remove it from memory.
+            // 持锁：否则可能正有另一个线程在 decrypt() 里改 m_data，
+            // 退出路径的清零会和它交错。
+            std::lock_guard<std::mutex> guard(obfuscateMutex());
             for (size_type i = 0; i < N; i++)
             {
                 m_data[i] = 0;
@@ -140,8 +170,23 @@ namespace ay
         }
 
         // Manually decrypt the string
+        //
+        // OBFUSCATE 产生的是**全局**对象，而转换运算符会在任何线程被隐式调用
+        // （渲染线程、游戏 hook 回调、后台扫描）。旧实现是裸的 check-then-act：
+        // 两个线程同时看到 m_encrypted == true 就都做一次 XOR，
+        // 数据被解两次 = 密文本身，返回的是乱码。
+        // 而 m_data 正在被写时另一线程在读，叠加成数据竞争。
+        //
+        // 用一把进程级锁把「判断 + 变换」变成原子操作。
+        // 临界区只有一次 XOR 的长度，冲突概率可以忽略。
         void decrypt()
         {
+            if (!m_encrypted)
+            {
+                return;
+            }
+            std::lock_guard<std::mutex> guard(obfuscateMutex());
+            // 拿到锁必须重新判断：等锁期间可能已被别的线程解密过
             if (m_encrypted)
             {
                 cipher(m_data, N, KEY);
@@ -152,6 +197,7 @@ namespace ay
         // Manually re-encrypt the string
         void encrypt()
         {
+            std::lock_guard<std::mutex> guard(obfuscateMutex());
             if (!m_encrypted)
             {
                 cipher(m_data, N, KEY);
@@ -171,8 +217,9 @@ namespace ay
         // not the string is currently obfuscated.
         char m_data[N];
 
-        // Whether data is currently encrypted
-        bool m_encrypted{ true };
+        // Whether data is currently encrypted.
+        // 只做「已解密就跳过」这个快速路径的判断；真正的状态转换在锁内。
+        std::atomic<bool> m_encrypted{true};
     };
 
     // This function exists purely to extract the number of elements 'N' in the
